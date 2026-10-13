@@ -688,11 +688,20 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | 无状态 Responses 兼容子集；复用同一账号池、粘性、冷却、用量与请求归档 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+
+### Responses 兼容范围
+
+`POST /v1/responses` 接受字符串或数组形式的 `input`，并支持 `instructions`、函数工具、`tool_choice`、`reasoning.effort` / `reasoning.summary`、`client_metadata` 与 `include:["reasoning.encrypted_content"]` 兼容标记。请求是无状态的；`store` 只接受 `false`/`null`，不支持 `conversation`、非空 `previous_response_id` 或后台响应。
+
+`text` 可以省略或为空对象；`text.format` 缺省按普通文本处理，明确值只接受 `{ "type": "text" }`，`text.verbosity` 仅校验 `low`、`medium`、`high` 后不转发。历史中的 `message.id`、assistant `phase`、函数调用 ID、reasoning summary 与 `encrypted_content` 会校验并按兼容规则回放，敏感字段不会写入 Chat 上游。namespace 工具会映射为请求级稳定的内部函数名，Responses 输出恢复原始 namespace 与函数名；hosted/opaque 工具会被明确丢弃，不能被伪造成可执行函数。
+
+非流式响应返回 `object:"response"`，终态为 `completed`、`incomplete` 或 `failed`。流式响应使用 `response.*` SSE 事件和连续 `sequence_number`，不会泄露 Chat 的 `[DONE]`；缺少上游终止标记、非法帧、工具参数截断或 error frame 时不会报告为 completed。`reasoning.summary` 生效时会输出 reasoning summary 的 added/delta/done 生命周期事件。
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
