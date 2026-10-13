@@ -22,12 +22,14 @@ import (
 )
 
 type ChatExecutionRequest struct {
-	Context  context.Context
-	Body     []byte
-	Model    string
-	Stream   bool
-	Headers  http.Header
-	ClientIP string
+	Context                    context.Context
+	Body                       []byte
+	Model                      string
+	Stream                     bool
+	Headers                    http.Header
+	ClientIP                   string
+	ResponsesDiagnostics       bool
+	ResponsesCandidateSections []string
 }
 
 type ChatRenderMeta struct {
@@ -70,6 +72,7 @@ type chatFailure struct {
 	Code    string
 	Message string
 	Hint    string
+	Param   string
 }
 
 // executeChat is the single owner of realm routing, prompt policy, sticky
@@ -248,6 +251,19 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 			} else {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			}
+			if req.ResponsesDiagnostics {
+				if param, unsupported := responsesUnsupportedUpstreamField(status, respBody, uerr); unsupported {
+					st.outcome = reqlog.OutcomeHTTPError
+					fail(acct.UID)
+					return ChatOutcome{Status: http.StatusBadRequest}, &chatFailure{
+						Status:  http.StatusBadRequest,
+						Code:    "unsupported_value",
+						Message: "The upstream rejected one or more request fields as unsupported.",
+						Hint:    responsesUnsupportedFieldHint(req.ResponsesCandidateSections),
+						Param:   param,
+					}
+				}
 			}
 			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
 				h.degrade.Trigger()

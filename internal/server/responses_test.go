@@ -614,6 +614,87 @@ func TestResponsesHandlerNonStreamingPreservesFinishAndUsage(t *testing.T) {
 	}
 }
 
+func TestResponsesUnsupportedUpstreamFieldFailsFastWithSafeDiagnostic(t *testing.T) {
+	calls := 0
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return http.StatusBadRequest, `{"error":{"message":"field is not supported (upstream-only-canary)","type":"invalid_request_error","param":"max_completion_tokens","code":"unsupported_value"}}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "responses-unsupported-a", AccessToken: "at-a", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		&auth.Auth{UID: "responses-unsupported-b", AccessToken: "at-b", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key"})
+	body := `{"model":"glm-5.2","input":"hello","max_output_tokens":64,"reasoning":{"effort":"medium"},"text":{"format":{"type":"text"}},"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}],"tool_choice":"auto"}`
+	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer key")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s want 400", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	errorBody := payload["error"].(map[string]any)
+	if errorBody["code"] != "unsupported_value" || errorBody["param"] != "max_output_tokens" {
+		t.Fatalf("error=%#v want unsupported_value with mapped Responses param", errorBody)
+	}
+	hint, ok := errorBody["gateway_hint"].(string)
+	if !ok {
+		t.Fatalf("gateway_hint missing: %#v", errorBody)
+	}
+	for _, section := range []string{"input/history", "reasoning", "text.format", "tools", "tool_choice", "output limits"} {
+		if !strings.Contains(hint, section) {
+			t.Errorf("gateway_hint=%q missing present section %q", hint, section)
+		}
+	}
+	for _, raw := range []string{"upstream-only-canary", "field is not supported"} {
+		if strings.Contains(w.Body.String(), raw) {
+			t.Errorf("upstream details leaked in response: %s", w.Body.String())
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls=%d want 1 (request-level rejection must not rotate accounts)", calls)
+	}
+	for _, uid := range []string{"responses-unsupported-a", "responses-unsupported-b"} {
+		status, ok := p.Status(uid)
+		if !ok || status.Cooling || status.Disabled || status.ErrTotal != 0 || status.BreakerFails != 0 {
+			t.Errorf("unsupported request must not penalize account %s: %+v", uid, status)
+		}
+	}
+}
+
+func TestResponsesNoHealthyAccountIsNotBlamedOnRequestFields(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		t.Fatal("upstream must not be called with an empty account pool")
+		return 0, "", false
+	})
+	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up, APIKey: "key"})
+	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hello","reasoning":{"effort":"medium"}}`))
+	r.Header.Set("Authorization", "Bearer key")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s want 503", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	errorBody := payload["error"].(map[string]any)
+	if errorBody["code"] != "no_healthy_account" {
+		t.Fatalf("error=%#v want no_healthy_account", errorBody)
+	}
+	if _, exists := errorBody["param"]; exists {
+		t.Fatalf("account availability error must not blame a request field: %#v", errorBody)
+	}
+	if strings.Contains(w.Body.String(), "unsupported_value") || strings.Contains(w.Body.String(), "request sections") {
+		t.Fatalf("account availability error was mislabeled as a request-field error: %s", w.Body.String())
+	}
+}
+
 func TestResponsesStreamingStateMachine(t *testing.T) {
 	stream := strings.Join([]string{
 		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"hello "}}]}`,

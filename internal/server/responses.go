@@ -1604,15 +1604,17 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		clientIP = upstream.ExtractClientIP(r)
 	}
 	out, failure := h.executeChat(ChatExecutionRequest{
-		Context:  r.Context(),
-		Body:     req.ChatBody,
-		Model:    req.Model,
-		Stream:   req.Stream,
-		Headers:  r.Header,
-		ClientIP: clientIP,
+		Context:                    r.Context(),
+		Body:                       req.ChatBody,
+		Model:                      req.Model,
+		Stream:                     req.Stream,
+		Headers:                    r.Header,
+		ClientIP:                   clientIP,
+		ResponsesDiagnostics:       true,
+		ResponsesCandidateSections: responsesCandidateSections(req),
 	}, &responsesRenderer{req: req, encoder: encoderIf(req.Stream, encoder)})
 	if failure != nil {
-		writeOpenAIErrorHint(w, failure.Status, failure.Code, failure.Message, failure.Hint)
+		writeResponsesExecutionError(w, failure)
 		return
 	}
 	if req.Stream {
@@ -1627,6 +1629,142 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", "upstream response was empty")
+}
+
+func responsesCandidateSections(req responsesRequest) []string {
+	var body map[string]json.RawMessage
+	if json.Unmarshal(req.ChatBody, &body) != nil || body == nil {
+		return []string{"model selection", "input/history"}
+	}
+	sections := make([]string, 0, 12)
+	add := func(key, label string) {
+		if _, ok := body[key]; ok {
+			sections = append(sections, label)
+		}
+	}
+	add("model", "model selection")
+	add("messages", "input/history")
+	add("tools", "tools")
+	add("tool_choice", "tool_choice")
+	if _, effort := body["reasoning_effort"]; effort {
+		sections = append(sections, "reasoning")
+	} else if _, summary := body["reasoning_summary"]; summary {
+		sections = append(sections, "reasoning")
+	}
+	add("response_format", "text.format")
+	add("max_completion_tokens", "output limits")
+	add("temperature", "temperature")
+	add("top_p", "top_p")
+	add("metadata", "metadata")
+	add("prompt_cache_key", "prompt caching")
+	add("parallel_tool_calls", "parallel tool calls")
+	return sections
+}
+
+func responsesUnsupportedFieldHint(sections []string) string {
+	if len(sections) == 0 {
+		return "Review the request fields sent to the upstream. Request values and message content are omitted."
+	}
+	return "Review these present request sections: " + strings.Join(sections, ", ") + ". Request values and message content are omitted."
+}
+
+func responsesUnsupportedUpstreamField(status int, body []byte, ue *upstream.Error) (string, bool) {
+	if status != http.StatusBadRequest {
+		return "", false
+	}
+	raw := string(body)
+	if len(body) == 0 && ue != nil {
+		raw = ue.Msg
+	}
+	var envelope map[string]any
+	_ = json.Unmarshal([]byte(raw), &envelope)
+	errorObject, _ := envelope["error"].(map[string]any)
+	code := firstStringValue(errorObject["code"], envelope["code"])
+	message := strings.ToLower(firstStringValue(errorObject["message"], envelope["message"], envelope["msg"]))
+	lower := strings.ToLower(raw)
+	unsupported := strings.EqualFold(strings.TrimSpace(code), "unsupported_value") ||
+		strings.Contains(message, "field is not supported") ||
+		strings.Contains(message, "unsupported field") ||
+		strings.Contains(message, "field is unsupported") ||
+		strings.Contains(lower, "field is not supported") ||
+		strings.Contains(lower, "unsupported field") ||
+		strings.Contains(lower, "field is unsupported")
+	if !unsupported {
+		return "", false
+	}
+	param := firstStringValue(errorObject["param"], envelope["param"])
+	return mapUpstreamResponsesParam(param), true
+}
+
+func firstStringValue(values ...any) string {
+	for _, value := range values {
+		if s, ok := value.(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+func mapUpstreamResponsesParam(param string) string {
+	param = strings.TrimSpace(param)
+	if param == "" || len(param) > 160 {
+		return ""
+	}
+	pathIs := func(root string) bool {
+		return param == root || strings.HasPrefix(param, root+".") || strings.HasPrefix(param, root+"[")
+	}
+	switch {
+	case pathIs("input") || pathIs("messages"):
+		return "input"
+	case pathIs("tools"):
+		return "tools"
+	case pathIs("tool_choice"):
+		return "tool_choice"
+	case pathIs("reasoning_effort"):
+		return "reasoning.effort"
+	case pathIs("reasoning_summary"):
+		return "reasoning.summary"
+	case pathIs("reasoning.effort"):
+		return "reasoning.effort"
+	case pathIs("reasoning.summary"):
+		return "reasoning.summary"
+	case pathIs("reasoning"):
+		return "reasoning"
+	case pathIs("response_format"):
+		return "text.format"
+	case pathIs("max_completion_tokens") || pathIs("max_tokens"):
+		return "max_output_tokens"
+	case pathIs("metadata"):
+		return "metadata"
+	case pathIs("prompt_cache_key"):
+		return "prompt_cache_key"
+	case pathIs("parallel_tool_calls"):
+		return "parallel_tool_calls"
+	case pathIs("text.format"):
+		return "text.format"
+	case pathIs("text.verbosity"):
+		return "text.verbosity"
+	case pathIs("instructions"), pathIs("model"), pathIs("stream"), pathIs("temperature"), pathIs("top_p"),
+		pathIs("max_output_tokens"), pathIs("text"):
+		return strings.SplitN(param, ".", 2)[0]
+	default:
+		return ""
+	}
+}
+
+func writeResponsesExecutionError(w http.ResponseWriter, failure *chatFailure) {
+	errorBody := map[string]any{
+		"message": failure.Message,
+		"type":    "api_error",
+		"code":    failure.Code,
+	}
+	if failure.Param != "" {
+		errorBody["param"] = failure.Param
+	}
+	if failure.Hint != "" {
+		errorBody["gateway_hint"] = failure.Hint
+	}
+	writeJSON(w, failure.Status, map[string]any{"error": errorBody})
 }
 
 func encoderIf(stream bool, encoder *responseSSEEncoder) *responseSSEEncoder {
