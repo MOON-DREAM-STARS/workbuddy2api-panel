@@ -962,6 +962,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if !canRetry {
 				applyUsageToChatStat(st, emptyRetryState.usage)
 				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
+				unbindSticky()
 				releaseHeld()
 				writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_empty_tool_turn", "upstream repeatedly ended a tool-enabled turn without a valid function call")
 				return

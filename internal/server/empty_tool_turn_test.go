@@ -606,15 +606,22 @@ func TestEmptyToolTurnMaxRetriesZeroReturns504WithoutSwitching(t *testing.T) {
 		&auth.Auth{UID: "zero-a", AccessToken: "zero-at-a", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "zero-b", AccessToken: "zero-at-b", ExpiresAt: 9999999999},
 	)
+	store := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     store,
+		Available: func() []string { return []string{"zero-a", "zero-b"} },
+	})
 	reqLog := reqlog.New(reqlog.Config{})
 	defer reqLog.Close()
 	h := NewHandler(Config{
-		Pool: p, Upstream: up, RequestLog: reqLog,
+		Pool: p, Upstream: up, Session: sess, RequestLog: reqLog,
 		EmptyToolTurnRetryModels: []string{"*"},
 		EmptyToolTurnMaxRetries:  0,
 		EmptyToolTurnRetryBudget: 75 * time.Second,
 	})
-	body := `{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"run"}],"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object"}}}],"tool_choice":"auto"}`
+	sess.Bind("conv-zero", "zero-a")
+	body := `{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"run"}],"metadata":{"conversation_id":"conv-zero"},"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object"}}}],"tool_choice":"auto"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
 	if rec.Code != http.StatusGatewayTimeout || !strings.Contains(rec.Body.String(), "upstream_empty_tool_turn") {
@@ -626,6 +633,9 @@ func TestEmptyToolTurnMaxRetriesZeroReturns504WithoutSwitching(t *testing.T) {
 	event := reqLog.Snapshot().Recent[0]
 	if event.Attempts != 1 || len(event.EmptyToolTurnAttempts) != 1 || event.EmptyToolTurnAttempts[0].Outcome != "exhausted" {
 		t.Fatalf("attempt history=%+v", event)
+	}
+	if uid, ok := store.lastUID("conv-zero"); ok {
+		t.Fatalf("terminal empty tool turn left sticky binding on %q", uid)
 	}
 }
 

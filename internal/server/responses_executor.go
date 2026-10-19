@@ -345,6 +345,7 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 			if !canRetry {
 				applyUsageToChatStat(st, emptyRetryState.usage)
 				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
+				unbindSticky()
 				releaseHeld()
 				return ChatOutcome{Status: http.StatusGatewayTimeout}, &chatFailure{
 					Status: http.StatusGatewayTimeout, Code: "upstream_empty_tool_turn",

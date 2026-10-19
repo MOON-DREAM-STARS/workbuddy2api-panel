@@ -62,7 +62,7 @@ func (s *emptyToolTurnRetryState) canRetry(now time.Time, hasAlternate bool) (bo
 
 func (s *emptyToolTurnRetryState) markRetry() { s.retries++ }
 
-// attemptContext 只给换号后的第二次尝试加本地截止时间；第一次尝试保持现有
+// attemptContext 只给换号后的后续尝试加本地截止时间；第一次尝试保持现有
 // 传输层/客户端超时语义，不被空工具回合预算强行截断。
 func (s *emptyToolTurnRetryState) attemptContext(parent context.Context, now time.Time) (context.Context, context.CancelFunc, bool) {
 	if s.retries == 0 || s.deadline.IsZero() || !now.Before(s.deadline) {
