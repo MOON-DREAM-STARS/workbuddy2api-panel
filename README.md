@@ -688,7 +688,7 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `POST /v1/responses` | Bearer（`api_key` 非空时） | 无状态 Responses 兼容子集；复用同一账号池、粘性、冷却、用量与请求归档 |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | 无状态 Responses 兼容子集（**默认关闭**，见下节「接口开关」）；复用同一账号池、粘性、冷却、用量与请求归档 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -697,11 +697,23 @@ http://127.0.0.1:7863/panel/
 
 ### Responses 兼容范围
 
-`POST /v1/responses` 接受字符串或数组形式的 `input`，并支持 `instructions`、函数工具、`tool_choice`、`reasoning.effort` / `reasoning.summary`、`client_metadata` 与 `include:["reasoning.encrypted_content"]` 兼容标记。请求是无状态的；`store` 只接受 `false`/`null`，不支持 `conversation`、非空 `previous_response_id` 或后台响应。
+**接口开关（`features.responses_enabled`，缺省 false）**：网关默认只提供 Chat API。关闭状态下 `POST /v1/responses` 在鉴权之前统一返回 `404` + `{"error":{"code":"endpoint_disabled",...}}`，端点表现为"不存在"；需要在面板「配置 → 服务」勾选「原生 Responses 接口」并保存即可热开启（无需重启），关回同理。开关经运行期快照（`livecfg`）读取，改动即时生效。
+
+`POST /v1/responses` 接受字符串或数组形式的 `input`，并支持 `instructions`、函数工具、`tool_choice`、`reasoning.effort` / `reasoning.summary`、`client_metadata` 与 `include:["reasoning.encrypted_content"]` 兼容标记。Codex 的 `stream_options.reasoning_summary_delivery="sequential_cutoff"`、`reasoning.context="all_turns"` 和 `service_tier="default"` 作为兼容提示接受后不转发；非默认服务等级、其它摘要交付方式和其它上下文模式会明确报不支持。Chat 上游的流式 usage 仍由网关注入，保证末帧用量可用于计费。请求是无状态的；`store` 只接受 `false`/`null`，不支持 `conversation`、非空 `previous_response_id` 或后台响应。
 
 `text` 可以省略或为空对象；`text.format` 缺省按普通文本处理，明确值只接受 `{ "type": "text" }`，`text.verbosity` 仅校验 `low`、`medium`、`high` 后不转发。历史中的 `message.id`、assistant `phase`、函数调用 ID、reasoning summary 与 `encrypted_content` 会校验并按兼容规则回放，敏感字段不会写入 Chat 上游。namespace 工具会映射为请求级稳定的内部函数名，Responses 输出恢复原始 namespace 与函数名；hosted/opaque 工具会被明确丢弃，不能被伪造成可执行函数。
 
 非流式响应返回 `object:"response"`，终态为 `completed`、`incomplete` 或 `failed`。流式响应使用 `response.*` SSE 事件和连续 `sequence_number`，不会泄露 Chat 的 `[DONE]`；缺少上游终止标记、非法帧、工具参数截断或 error frame 时不会报告为 completed。`reasoning.summary` 生效时会输出 reasoning summary 的 added/delta/done 生命周期事件。
+
+### `stop` 空工具回合保护（Issue #149）
+
+`features.empty_tool_turn_retry_models` 缺省为 `["*"]`，即对所有模型启用；也可以配置模型名单，空名单可显式关闭。只有请求声明了函数工具、`tool_choice` 缺省或为 `auto` 时才检查。若上游原始 SSE 明确带有 `[DONE]` 和 `finish_reason:"stop"`，没有 error frame，且经过现有 DSML 标记修复后仍没有合法 `tool_calls`，网关会在向客户端提交任何输出前，使用同一账号、同一份准备后请求体和同一轮 `X-Conversation-Request-ID` 重试，最多 3 次（总计最多 4 次上游调用）。reasoning-only、短正文和长正文都按相同规则检查；不会把历史思考注入 `<thought>`。
+
+这类请求的候选 SSE 会先缓冲以确保失败尝试不泄漏给 Chat 或 Responses 客户端；单次上游响应上限为 8 MiB，超限 fail-closed 返回 `502 upstream_validation_limit`。连续耗尽返回 `502 upstream_empty_tool_turn`，不返回前几次的部分文本，也不对账号施加冷却/熔断惩罚。恢复后对外 usage 汇总每次尝试的输入、输出、缓存、reasoning 和 credit，并重算 total；请求归档及服务日志记录每次尝试的脱敏结果和用量。面板「配置 → 服务」中的名单按每行一个模型热更新，默认填入 `*`，清空即禁用。
+
+Codex 的上下文压缩请求（最后一条 user 消息以 `You are performing a CONTEXT CHECKPOINT COMPACTION.` 开头）即使命中模型名单也不会进入上述重试；压缩摘要是普通 `stop` 响应，不能按空工具回合处理。
+
+上游 Chat 请求规范化还会剔除 `messages[].content` 中 Responses 风格的 `reasoning_text` 内容块，避免 NewAPI 的 Responses→Chat 转换把历史 reasoning 项作为内容重放到 WorkBuddy，触发 `11101 unsupported content type`。只含该块的消息会被删除；带工具调用的 assistant 消息保留调用并把 content 置为 null。
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
