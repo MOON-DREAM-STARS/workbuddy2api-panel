@@ -707,9 +707,9 @@ http://127.0.0.1:7863/panel/
 
 ### `stop` 空工具回合保护（Issue #149）
 
-`features.empty_tool_turn_retry_models` 缺省为 `["*"]`，即对所有模型启用；也可以配置模型名单，空名单可显式关闭。只有请求声明了函数工具、`tool_choice` 缺省或为 `auto` 时才检查。若上游原始 SSE 明确带有 `[DONE]` 和 `finish_reason:"stop"`，没有 error frame，且经过现有 DSML 标记修复后仍没有合法 `tool_calls`，网关会在向客户端提交任何输出前，使用同一账号、同一份准备后请求体和同一轮 `X-Conversation-Request-ID` 重试，最多 3 次（总计最多 4 次上游调用）。reasoning-only、短正文和长正文都按相同规则检查；不会把历史思考注入 `<thought>`。
+`features.empty_tool_turn_retry_models` 缺省为 `["*"]`，即对所有模型启用；也可以配置模型名单，空名单可显式关闭。只有请求声明了函数工具、`tool_choice` 缺省或为 `auto` 时才检查。若上游原始 SSE 明确带有 `[DONE]` 和 `finish_reason:"stop"`，没有 error frame，且经过现有 DSML 标记修复后仍没有合法 `tool_calls`，网关会在向客户端提交任何输出前换一个健康账号重试；每次重试沿用同一逻辑请求和 `X-Conversation-Request-ID`，但按账号重新计算 `prompt_cache_key`。`features.empty_tool_turn_max_retries` 缺省为 `1`，即原始请求后最多换一个账号；`features.empty_tool_turn_retry_budget` 缺省为 `75s`，从请求开始计算，第二次尝试不得超过该截止时间。reasoning-only、短正文和长正文都按相同规则检查；不会把历史思考注入 `<thought>`。
 
-这类请求的候选 SSE 会先缓冲以确保失败尝试不泄漏给 Chat 或 Responses 客户端；单次上游响应上限为 8 MiB，超限 fail-closed 返回 `502 upstream_validation_limit`。连续耗尽返回 `502 upstream_empty_tool_turn`，不返回前几次的部分文本，也不对账号施加冷却/熔断惩罚。恢复后对外 usage 汇总每次尝试的输入、输出、缓存、reasoning 和 credit，并重算 total；请求归档及服务日志记录每次尝试的脱敏结果和用量。面板「配置 → 服务」中的名单按每行一个模型热更新，默认填入 `*`，清空即禁用。
+这类请求的候选 SSE 会先缓冲以确保失败尝试不泄漏给 Chat 或 Responses 客户端；单次上游响应上限为 8 MiB，超限 fail-closed 返回 `502 upstream_validation_limit`。换号耗尽、没有其他健康账号或预算不足时返回 `504 upstream_empty_tool_turn`，不返回前几次的部分文本，也不对账号施加冷却/熔断惩罚。选择 504 是为了让 NewAPI 当前“504 永不重试”的规则停止同一渠道重复放大；后续启用低优先级降级渠道时再改为 502。恢复后对外 usage 汇总每次尝试的输入、输出、缓存、reasoning 和 credit，并重算 total；请求归档及服务日志记录每次尝试的账号脱敏标签、耗时、TTFB、结果和用量。面板「配置 → 服务」中的模型名单、换号次数和预算均可热更新。
 
 Codex 的上下文压缩请求（最后一条 user 消息以 `You are performing a CONTEXT CHECKPOINT COMPACTION.` 开头）即使命中模型名单也不会进入上述重试；压缩摘要是普通 `stop` 响应，不能按空工具回合处理。
 
