@@ -8,7 +8,7 @@ import (
 )
 
 // EmptyToolTurnObservation contains only response facts needed to decide
-// whether an opt-in same-account retry is safe. Response is the ordinary
+// whether an opt-in retry is safe. Response is the ordinary
 // aggregate after the existing DSML repair has been applied.
 type EmptyToolTurnObservation struct {
 	SawDone           bool

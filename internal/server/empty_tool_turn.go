@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,12 +13,80 @@ import (
 )
 
 const (
-	emptyToolTurnMaxRetries     = 3
 	validatedResponseLimit      = 8 << 20
 	codexCompactionPromptPrefix = "You are performing a CONTEXT CHECKPOINT COMPACTION."
+	// emptyToolTurnMinRetryRemaining 防止在 75 秒预算只剩几秒时再发起一次
+	// 必然被截断的上游请求。它只约束“是否值得开始第二次尝试”，不截断第一次。
+	emptyToolTurnMinRetryRemaining = 15 * time.Second
 )
 
 var errValidatedResponseTooLarge = errors.New("upstream response exceeded the 8 MiB validation buffer")
+
+type emptyToolTurnRetryState struct {
+	maxRetries int
+	retries    int
+	deadline   time.Time
+	usage      map[string]any
+}
+
+func (h *Handler) newEmptyToolTurnRetryState(started time.Time) emptyToolTurnRetryState {
+	live := h.loadLive()
+	state := emptyToolTurnRetryState{maxRetries: live.EmptyToolTurnMaxRetries}
+	if live.EmptyToolTurnRetryBudget > 0 {
+		state.deadline = started.Add(live.EmptyToolTurnRetryBudget)
+	}
+	return state
+}
+
+func (s *emptyToolTurnRetryState) noteUsage(response map[string]any) {
+	if usage := usageMap(response); usage != nil {
+		s.usage = mergeUsageMaps(s.usage, usage)
+	}
+}
+
+func (s *emptyToolTurnRetryState) hasRetried() bool { return s.retries > 0 }
+
+// canRetry 返回 false 时，reason 直接作为请求归档的终态标签。
+func (s *emptyToolTurnRetryState) canRetry(now time.Time, hasAlternate bool) (bool, string) {
+	if s.retries >= s.maxRetries {
+		return false, "exhausted"
+	}
+	if !hasAlternate {
+		return false, "no_alternate_account"
+	}
+	if !s.deadline.IsZero() && now.Add(emptyToolTurnMinRetryRemaining).After(s.deadline) {
+		return false, "deadline"
+	}
+	return true, "retry_account"
+}
+
+func (s *emptyToolTurnRetryState) markRetry() { s.retries++ }
+
+// attemptContext 只给换号后的第二次尝试加本地截止时间；第一次尝试保持现有
+// 传输层/客户端超时语义，不被空工具回合预算强行截断。
+func (s *emptyToolTurnRetryState) attemptContext(parent context.Context, now time.Time) (context.Context, context.CancelFunc, bool) {
+	if s.retries == 0 || s.deadline.IsZero() || !now.Before(s.deadline) {
+		return parent, func() {}, false
+	}
+	ctx, cancel := context.WithDeadline(parent, s.deadline)
+	return ctx, cancel, true
+}
+
+func (s *emptyToolTurnRetryState) deadlineHit(localDeadline bool, ctx context.Context) bool {
+	if !localDeadline || s.deadline.IsZero() {
+		return false
+	}
+	return errors.Is(ctx.Err(), context.DeadlineExceeded) || !time.Now().Before(s.deadline)
+}
+
+func (h *Handler) hasAlternateEmptyToolTurnAccount(model, realm string, tried map[string]bool) bool {
+	for _, uid := range h.cfg.Pool.AvailableUIDsForModelRealm(model, realm) {
+		if !tried[uid] {
+			return true
+		}
+	}
+	return false
+}
 
 func (h *Handler) emptyToolTurnRetryEnabled(model string, requestBody []byte) bool {
 	if !requestUsesAutoFunctionTools(requestBody) {
@@ -26,7 +95,7 @@ func (h *Handler) emptyToolTurnRetryEnabled(model string, requestBody []byte) bo
 	// Codex uses the same tool-enabled Chat shape for its context compaction
 	// turn. The compaction response is intentionally a summary with
 	// finish_reason=stop and no tool calls, so treating it as an empty tool
-	// turn would retry the summary four times and return 502.
+	// turn would retry the summary and return a terminal error.
 	if isCodexCompactionRequest(requestBody) {
 		log.Printf("INFO: [server] empty_tool_turn skipped reason=codex_compaction model=%s", model)
 		return false

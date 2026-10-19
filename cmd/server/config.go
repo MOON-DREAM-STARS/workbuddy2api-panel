@@ -158,8 +158,14 @@ type Config struct {
 		// 热生效（经 livecfg 快照），面板保存即时生效，无需重启。
 		ResponsesEnabled bool `json:"responses_enabled"`
 		// EmptyToolTurnRetryModels 对指定模型启用 stop + 无合法工具调用时的
-		// 有界同账号重试。缺省 ["*"] 表示所有模型；模型 ID 可带 cn:/global: 前缀。
+		// 有界换号重试。缺省 ["*"] 表示所有模型；模型 ID 可带 cn:/global: 前缀。
 		EmptyToolTurnRetryModels []string `json:"empty_tool_turn_retry_models"`
+		// EmptyToolTurnMaxRetries 空工具回合最多换号次数；0 = 只检测不换号。
+		// 缺省 1（原始请求 + 一次换号重试）。
+		EmptyToolTurnMaxRetries int `json:"empty_tool_turn_max_retries"`
+		// EmptyToolTurnRetryBudget 空工具回合从请求开始计算的总预算；第二次
+		// 尝试不得越过该截止时间。缺省 "75s"，允许 15s..180s。
+		EmptyToolTurnRetryBudget string `json:"empty_tool_turn_retry_budget"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -236,6 +242,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// EmptyToolTurnRetryBudgetDur 是 features.empty_tool_turn_retry_budget 解析后的值。
+	EmptyToolTurnRetryBudgetDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -281,6 +289,8 @@ func Default() *Config {
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.EmptyToolTurnRetryModels = []string{"*"}
+	c.Features.EmptyToolTurnMaxRetries = 1
+	c.Features.EmptyToolTurnRetryBudget = "75s"
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -463,6 +473,18 @@ func applyEnv(c *Config) {
 func (c *Config) normalize() error {
 	var err error
 	c.Features.EmptyToolTurnRetryModels = normalizeModelNames(c.Features.EmptyToolTurnRetryModels)
+	if c.Features.EmptyToolTurnMaxRetries < 0 || c.Features.EmptyToolTurnMaxRetries > 2 {
+		return fmt.Errorf("features.empty_tool_turn_max_retries must be between 0 and 2")
+	}
+	if c.Features.EmptyToolTurnRetryBudget == "" {
+		c.Features.EmptyToolTurnRetryBudget = "75s"
+	}
+	if c.EmptyToolTurnRetryBudgetDur, err = time.ParseDuration(c.Features.EmptyToolTurnRetryBudget); err != nil {
+		return fmt.Errorf("features.empty_tool_turn_retry_budget: %w", err)
+	}
+	if c.EmptyToolTurnRetryBudgetDur < 15*time.Second || c.EmptyToolTurnRetryBudgetDur > 180*time.Second {
+		return fmt.Errorf("features.empty_tool_turn_retry_budget must be between 15s and 180s")
+	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}

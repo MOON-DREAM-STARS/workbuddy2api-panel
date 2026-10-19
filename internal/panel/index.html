@@ -916,7 +916,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <code>/v1/responses</code> 兼容子集；关闭时该路径返回 404（<code>endpoint_disabled</code>）。改动即时生效，无需重启。</div>
             <label class="fld"><span class="lb">空工具回合重试模型（每行一个，* 表示所有模型；留空关闭）</span>
               <textarea name="empty_tool_turn_retry_models" rows="3" placeholder="*（默认）"></textarea>
-              <span class="hint">默认对所有模型启用。仅当请求声明函数工具且 tool_choice 为默认/auto 时生效；模型以 stop 收尾但没有合法工具调用时，同账号最多重试 3 次。该请求会在校验期间缓冲，单次上游响应上限 8 MiB；名单可热更新。</span></label>
+              <span class="hint">默认对所有模型启用。仅当请求声明函数工具且 tool_choice 为默认/auto 时生效；模型以 stop 收尾但没有合法工具调用时，换健康账号重试。该请求会在校验期间缓冲，单次上游响应上限 8 MiB；名单可热更新。</span></label>
+            <div class="grid2">
+              <label class="fld"><span class="lb">空工具回合最多换号次数</span>
+                <input name="empty_tool_turn_max_retries" type="number" min="0" max="2" step="1" placeholder="1">
+                <span class="hint">0 = 只检测不换号；默认 1，即原始请求后最多换一个账号。热生效。</span></label>
+              <label class="fld"><span class="lb">空工具回合重试总预算</span>
+                <input name="empty_tool_turn_retry_budget" placeholder="75s">
+                <span class="hint">从请求开始计算，允许 15s–180s；第二次尝试不得超过该截止时间。热生效。</span></label>
+            </div>
           </div>
         </div>
 

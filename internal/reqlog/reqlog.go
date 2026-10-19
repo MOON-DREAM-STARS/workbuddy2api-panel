@@ -93,6 +93,9 @@ type Event struct {
 type EmptyToolTurnAttempt struct {
 	Attempt          int     `json:"attempt"`
 	Outcome          string  `json:"outcome"`
+	Account          string  `json:"account,omitempty"`
+	DurationMs       int64   `json:"duration_ms,omitempty"`
+	TTFBMs           int64   `json:"ttfb_ms,omitempty"`
 	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
 	CompletionTokens int64   `json:"completion_tokens,omitempty"`
 	TotalTokens      int64   `json:"total_tokens,omitempty"`

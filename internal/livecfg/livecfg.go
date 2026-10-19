@@ -21,6 +21,8 @@ type Snapshot struct {
 	RecordClientInfo         bool          // 请求日志是否记录调用来源（客户端 IP / UA）
 	ResponsesEnabled         bool          // 原生 Responses 接口开关（缺省 false = 仅 Chat API）
 	EmptyToolTurnRetryModels []string      // 指定模型的 stop + 空工具回合重试名单；"*" 表示所有模型
+	EmptyToolTurnMaxRetries  int           // 空工具回合最多换号次数；0 = 只检测不换号
+	EmptyToolTurnRetryBudget time.Duration // 空工具回合从请求开始计算的总预算；0 = 不设截止
 }
 
 // Holder 原子持有当前快照。

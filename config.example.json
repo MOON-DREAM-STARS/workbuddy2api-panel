@@ -56,7 +56,9 @@
   "features": {
     "sanitize_blacklist_fingerprints": true,
     "responses_enabled": false,
-    "empty_tool_turn_retry_models": ["*"]
+    "empty_tool_turn_retry_models": ["*"],
+    "empty_tool_turn_max_retries": 1,
+    "empty_tool_turn_retry_budget": "75s"
   },
   "prompt": {
     "mode": "passthrough",

@@ -171,7 +171,12 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 	}
 	chatMeta.TraceID = req.Headers.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	emptyRetryState := h.newEmptyToolTurnRetryState(st.start)
+	accountAttempts := h.cfg.MaxRotate
+	if emptyToolRetryEnabled && emptyRetryState.maxRetries+1 > accountAttempts {
+		accountAttempts = emptyRetryState.maxRetries + 1
+	}
+	for i := 0; i < accountAttempts; i++ {
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
@@ -227,27 +232,56 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 		if emptyToolRetryEnabled {
 			preparedBody = h.cfg.Upstream.PrepareChatBody(acct, req.Body, chatMeta)
 		}
-		retryCount := 0
-		var retryUsage map[string]any
 		var bufferedStats *chatStatsReader
 		var finalObservation *upstream.EmptyToolTurnObservation
 		var rc io.ReadCloser
 		var status int
 		var respBody []byte
 		var terr error
+		retryNextAccount := false
 		for {
 			attemptStarted = time.Now()
+			attemptCtx := ctx
+			attemptCancel := func() {}
+			localDeadline := false
 			if emptyToolRetryEnabled {
-				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamPreparedContext(ctx, acct, preparedBody, req.ClientIP, chatMeta)
+				attemptCtx, attemptCancel, localDeadline = emptyRetryState.attemptContext(attemptCtx, attemptStarted)
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamPreparedContext(attemptCtx, acct, preparedBody, req.ClientIP, chatMeta)
 			} else {
 				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(ctx, acct, req.Body, req.ClientIP, chatMeta)
 			}
+			if terr != nil && emptyRetryState.deadlineHit(localDeadline, attemptCtx) {
+				attemptCancel()
+				recordResponsesUsage(h, st, acct.UID, bareModel, pool.TokenUsageDelta{}, 0, false, attemptStarted)
+				recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname),
+					emptyRetryState.retries+1, "deadline", nil, time.Since(attemptStarted), 0)
+				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
+				releaseHeld()
+				return ChatOutcome{Status: http.StatusGatewayTimeout}, &chatFailure{
+					Status: http.StatusGatewayTimeout, Code: "upstream_empty_tool_turn",
+					Message: "empty tool-turn retry budget expired",
+				}
+			}
 			if terr != nil || status >= 400 || !emptyToolRetryEnabled {
+				attemptCancel()
 				break
 			}
 			bufferedStats = newChatStatsReaderSince(rc, attemptStarted)
 			raw, readErr := readValidatedResponse(bufferedStats)
 			_ = rc.Close()
+			attemptCancel()
+			if readErr != nil && emptyRetryState.deadlineHit(localDeadline, attemptCtx) {
+				credit, hasCredit := bufferedStats.Credit()
+				recordResponsesUsage(h, st, acct.UID, bareModel, bufferedStats.Usage(), credit, hasCredit, attemptStarted)
+				recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname),
+					emptyRetryState.retries+1, "deadline", nil, time.Since(attemptStarted), bufferedStats.TTFB())
+				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
+				releaseHeld()
+				return ChatOutcome{Status: http.StatusGatewayTimeout}, &chatFailure{
+					Status: http.StatusGatewayTimeout, Code: "upstream_empty_tool_turn",
+					Message: "empty tool-turn retry budget expired",
+				}
+			}
 			if errors.Is(readErr, errValidatedResponseTooLarge) {
 				credit, hasCredit := bufferedStats.Credit()
 				delta := bufferedStats.Usage()
@@ -277,12 +311,13 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 			}
 			finalObservation = &observation
 			if !observation.EmptyToolTurnCandidate() {
-				if retryCount > 0 {
+				if emptyRetryState.hasRetried() {
 					result := "terminal_" + observation.EmptyToolTurnTerminalReason()
 					if observation.ValidToolCalls > 0 {
 						result = "recovered"
 					}
-					recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname), retryCount+1, result, observation.Response)
+					recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname),
+						emptyRetryState.retries+1, result, observation.Response, time.Since(attemptStarted), bufferedStats.TTFB())
 				}
 				break
 			}
@@ -294,7 +329,7 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 					miss, _ := upstream.UsageCacheMissTokens(usage)
 					st.cacheHit, st.cacheMiss, st.hasCache = int64(hit), int64(miss), true
 				}
-				retryUsage = mergeUsageMaps(retryUsage, usage)
+				emptyRetryState.noteUsage(observation.Response)
 			}
 			fillStatFromUsageCompat(st, observation.Response)
 			credit, total, hasCredit := usageCreditTotal(observation.Response)
@@ -302,19 +337,28 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 			if hasCredit {
 				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 			}
-			attemptNumber := retryCount + 1
-			if retryCount >= emptyToolTurnMaxRetries {
-				recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname), attemptNumber, "exhausted", observation.Response)
-				applyUsageToChatStat(st, retryUsage)
-				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
+			hasAlternate := h.hasAlternateEmptyToolTurnAccount(bareModel, realm, tried)
+			canRetry, outcome := emptyRetryState.canRetry(time.Now(), hasAlternate)
+			attemptNumber := emptyRetryState.retries + 1
+			recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname),
+				attemptNumber, outcome, observation.Response, time.Since(attemptStarted), bufferedStats.TTFB())
+			if !canRetry {
+				applyUsageToChatStat(st, emptyRetryState.usage)
+				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
 				releaseHeld()
-				return ChatOutcome{Status: http.StatusBadGateway}, &chatFailure{
-					Status: http.StatusBadGateway, Code: "upstream_empty_tool_turn",
+				return ChatOutcome{Status: http.StatusGatewayTimeout}, &chatFailure{
+					Status: http.StatusGatewayTimeout, Code: "upstream_empty_tool_turn",
 					Message: "upstream repeatedly ended a tool-enabled turn without a valid function call",
 				}
 			}
-			recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname), attemptNumber, "retry", observation.Response)
-			retryCount++
+			emptyRetryState.markRetry()
+			releaseHeld()
+			unbindSticky()
+			retryNextAccount = true
+			break
+		}
+		if retryNextAccount {
+			continue
 		}
 		var uerr *upstream.Error
 		if errors.As(terr, &uerr) {
@@ -404,7 +448,7 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 			continue
 		}
 
-		priorUsage := retryUsage
+		priorUsage := emptyRetryState.usage
 		if finalObservation == nil || !finalObservation.SawDone || finalObservation.SawErrorFrame {
 			priorUsage = nil
 		}
@@ -475,8 +519,8 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 		if !recordedUsage {
 			recordResponsesUsage(h, st, acct.UID, bareModel, pool.TokenUsageDelta{}, 0, false, attemptStarted)
 		}
-		if retryCount > 0 && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame {
-			applyUsageToChatStat(st, mergeUsageMaps(retryUsage, usageMap(finalObservation.Response)))
+		if emptyRetryState.hasRetried() && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame {
+			applyUsageToChatStat(st, mergeUsageMaps(emptyRetryState.usage, usageMap(finalObservation.Response)))
 		}
 		return out, nil
 	}

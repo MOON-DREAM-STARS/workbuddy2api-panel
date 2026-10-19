@@ -82,6 +82,8 @@ type Config struct {
 	// Responses 子集。Live 快照优先，本字段是 Live=nil 场景（测试/裸用）的静态兜底。
 	ResponsesEnabled         bool
 	EmptyToolTurnRetryModels []string
+	EmptyToolTurnMaxRetries  int
+	EmptyToolTurnRetryBudget time.Duration
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -95,6 +97,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		RecordClientInfo:         h.cfg.RecordClientInfo,
 		ResponsesEnabled:         h.cfg.ResponsesEnabled,
 		EmptyToolTurnRetryModels: append([]string(nil), h.cfg.EmptyToolTurnRetryModels...),
+		EmptyToolTurnMaxRetries:  h.cfg.EmptyToolTurnMaxRetries,
+		EmptyToolTurnRetryBudget: h.cfg.EmptyToolTurnRetryBudget,
 	}
 }
 
@@ -765,7 +769,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	emptyRetryState := h.newEmptyToolTurnRetryState(st.start)
+	accountAttempts := h.cfg.MaxRotate
+	if emptyToolRetryEnabled && emptyRetryState.maxRetries+1 > accountAttempts {
+		accountAttempts = emptyRetryState.maxRetries + 1
+	}
+	for i := 0; i < accountAttempts; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -834,14 +843,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 仅对显式启用模型的工具请求缓冲响应；语义重试保持同一账号、
-		// 同一份准备后请求体和同一轮 ConversationRequestID。
+		// 仅对显式启用模型的工具请求缓冲响应；每次换号重新准备请求体，
+		// 保留同一轮 ConversationRequestID，但 prompt_cache_key 必须按账号重算。
 		var preparedBody []byte
 		if emptyToolRetryEnabled {
 			preparedBody = h.cfg.Upstream.PrepareChatBody(acct, body, chatMeta)
 		}
-		retryCount := 0
-		var retryUsage map[string]any
 		var bufferedStats *chatStatsReader
 		var finalObservation *upstream.EmptyToolTurnObservation
 		var rc io.ReadCloser
@@ -849,20 +856,50 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var respBody []byte
 		var terr error
 		var attemptStarted time.Time
+		retryNextAccount := false
 		for {
 			// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 			attemptStarted = time.Now()
+			attemptCtx := r.Context()
+			attemptCancel := func() {}
+			localDeadline := false
 			if emptyToolRetryEnabled {
-				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamPreparedContext(r.Context(), acct, preparedBody, clientIP, chatMeta)
+				attemptCtx, attemptCancel, localDeadline = emptyRetryState.attemptContext(attemptCtx, attemptStarted)
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamPreparedContext(attemptCtx, acct, preparedBody, clientIP, chatMeta)
 			} else {
 				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
 			}
+			if terr != nil && emptyRetryState.deadlineHit(localDeadline, attemptCtx) {
+				attemptCancel()
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname),
+					emptyRetryState.retries+1, "deadline", nil, time.Since(attemptStarted), 0)
+				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
+				releaseHeld()
+				writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_empty_tool_turn", "empty tool-turn retry budget expired")
+				return
+			}
 			if terr != nil || status >= 400 || !emptyToolRetryEnabled {
+				attemptCancel()
 				break
 			}
 			bufferedStats = newChatStatsReaderSince(rc, attemptStarted)
 			raw, readErr := readValidatedResponse(bufferedStats)
 			_ = rc.Close()
+			attemptCancel()
+			if readErr != nil && emptyRetryState.deadlineHit(localDeadline, attemptCtx) {
+				if hit, miss, ok := bufferedStats.CacheTokens(); ok {
+					st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
+				}
+				credit, hasCredit := bufferedStats.Credit()
+				recordAttempt(acct.UID, bufferedStats.Usage(), credit, hasCredit, attemptStarted, bufferedStats.TTFB())
+				recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname),
+					emptyRetryState.retries+1, "deadline", nil, time.Since(attemptStarted), bufferedStats.TTFB())
+				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
+				releaseHeld()
+				writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_empty_tool_turn", "empty tool-turn retry budget expired")
+				return
+			}
 			if errors.Is(readErr, errValidatedResponseTooLarge) {
 				if hit, miss, ok := bufferedStats.CacheTokens(); ok {
 					st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
@@ -892,19 +929,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			finalObservation = &observation
 			if !observation.EmptyToolTurnCandidate() {
-				if retryCount > 0 {
+				if emptyRetryState.hasRetried() {
 					result := "terminal_" + observation.EmptyToolTurnTerminalReason()
 					if observation.ValidToolCalls > 0 {
 						result = "recovered"
 					}
-					recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname), retryCount+1, result, observation.Response)
+					recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname),
+						emptyRetryState.retries+1, result, observation.Response, time.Since(attemptStarted), bufferedStats.TTFB())
 				}
 				break
 			}
 
 			st.cacheHit, st.cacheMiss, st.hasCache = 0, 0, false
 			if usage := usageMap(observation.Response); usage != nil {
-				retryUsage = mergeUsageMaps(retryUsage, usage)
+				emptyRetryState.noteUsage(observation.Response)
 				if hit, ok := upstream.UsageCacheHitTokens(usage); ok {
 					miss, _ := upstream.UsageCacheMissTokens(usage)
 					st.cacheHit, st.cacheMiss, st.hasCache = int64(hit), int64(miss), true
@@ -916,17 +954,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if hasCredit {
 				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 			}
-			attemptNumber := retryCount + 1
-			if retryCount >= emptyToolTurnMaxRetries {
-				recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname), attemptNumber, "exhausted", observation.Response)
-				applyUsageToChatStat(st, retryUsage)
-				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
+			hasAlternate := h.hasAlternateEmptyToolTurnAccount(bareModel, realm, tried)
+			canRetry, outcome := emptyRetryState.canRetry(time.Now(), hasAlternate)
+			attemptNumber := emptyRetryState.retries + 1
+			recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname),
+				attemptNumber, outcome, observation.Response, time.Since(attemptStarted), bufferedStats.TTFB())
+			if !canRetry {
+				applyUsageToChatStat(st, emptyRetryState.usage)
+				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
 				releaseHeld()
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_empty_tool_turn", "upstream repeatedly ended a tool-enabled turn without a valid function call")
+				writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_empty_tool_turn", "upstream repeatedly ended a tool-enabled turn without a valid function call")
 				return
 			}
-			recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname), attemptNumber, "retry", observation.Response)
-			retryCount++
+			emptyRetryState.markRetry()
+			releaseHeld()
+			unbindSticky()
+			retryNextAccount = true
+			break
+		}
+		if retryNextAccount {
+			continue
 		}
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析）。传输层错误（非 *Error）走抖动换号分支；防御分支
@@ -1186,11 +1233,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 				}
 			}
-			if retryCount > 0 && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame && !upstream.IsEmptyStreamError(sErr) {
-				applyUsageToChatStat(st, mergeUsageMaps(retryUsage, usageMap(finalObservation.Response)))
+			if emptyRetryState.hasRetried() && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame && !upstream.IsEmptyStreamError(sErr) {
+				applyUsageToChatStat(st, mergeUsageMaps(emptyRetryState.usage, usageMap(finalObservation.Response)))
 			}
 			if bufferedWriter != nil {
-				priorUsage := retryUsage
+				priorUsage := emptyRetryState.usage
 				if finalObservation == nil || !finalObservation.SawDone || finalObservation.SawErrorFrame || upstream.IsEmptyStreamError(sErr) {
 					priorUsage = nil
 				}
@@ -1233,8 +1280,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 		}
-		if retryCount > 0 && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame {
-			resp["usage"] = mergeUsageMaps(retryUsage, usageMap(resp))
+		if emptyRetryState.hasRetried() && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame {
+			resp["usage"] = mergeUsageMaps(emptyRetryState.usage, usageMap(resp))
 			applyUsageToChatStat(st, usageMap(resp))
 		}
 		writeJSON(w, http.StatusOK, resp)

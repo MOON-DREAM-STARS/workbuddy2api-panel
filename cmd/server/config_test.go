@@ -31,13 +31,29 @@ func TestEmptyToolTurnRetryModelsDefaultAndNormalize(t *testing.T) {
 	if !reflect.DeepEqual(defaults.Features.EmptyToolTurnRetryModels, []string{"*"}) {
 		t.Fatalf("default retry models=%v want [*]", defaults.Features.EmptyToolTurnRetryModels)
 	}
-	configured, err := ParseConfig([]byte(`{"features":{"empty_tool_turn_retry_models":[" cn:deepseek-v4.1-flash ","cn:deepseek-v4.1-flash","", "global:other", " * "]}}`))
+	if defaults.Features.EmptyToolTurnMaxRetries != 1 || defaults.EmptyToolTurnRetryBudgetDur != 75*time.Second {
+		t.Fatalf("default retry policy = max:%d budget:%v", defaults.Features.EmptyToolTurnMaxRetries, defaults.EmptyToolTurnRetryBudgetDur)
+	}
+	configured, err := ParseConfig([]byte(`{"features":{"empty_tool_turn_retry_models":[" cn:deepseek-v4.1-flash ","cn:deepseek-v4.1-flash","", "global:other", " * "],"empty_tool_turn_max_retries":2,"empty_tool_turn_retry_budget":"90s"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"cn:deepseek-v4.1-flash", "global:other", "*"}
 	if !reflect.DeepEqual(configured.Features.EmptyToolTurnRetryModels, want) {
 		t.Fatalf("retry models=%v want %v", configured.Features.EmptyToolTurnRetryModels, want)
+	}
+	if configured.Features.EmptyToolTurnMaxRetries != 2 || configured.EmptyToolTurnRetryBudgetDur != 90*time.Second {
+		t.Fatalf("configured retry policy = max:%d budget:%v", configured.Features.EmptyToolTurnMaxRetries, configured.EmptyToolTurnRetryBudgetDur)
+	}
+	for _, body := range []string{
+		`{"features":{"empty_tool_turn_max_retries":3}}`,
+		`{"features":{"empty_tool_turn_retry_budget":"10s"}}`,
+		`{"features":{"empty_tool_turn_retry_budget":"181s"}}`,
+		`{"features":{"empty_tool_turn_retry_budget":"oops"}}`,
+	} {
+		if _, err := ParseConfig([]byte(body)); err == nil {
+			t.Fatalf("want error for %s", body)
+		}
 	}
 }
 

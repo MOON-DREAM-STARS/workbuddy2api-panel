@@ -233,6 +233,8 @@ func main() {
 	} else {
 		log.Printf("原生 Responses 接口关闭（缺省，features.responses_enabled=false）：仅提供 /v1/chat/completions；面板可热开启")
 	}
+	log.Printf("空工具回合保护：models=%v max_retries=%d budget=%s（换号重试，耗尽返回 504）",
+		cfg.Features.EmptyToolTurnRetryModels, cfg.Features.EmptyToolTurnMaxRetries, cfg.EmptyToolTurnRetryBudgetDur)
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
@@ -244,6 +246,8 @@ func main() {
 		RecordClientInfo:         cfg.Logging.RequestClientInfo,
 		ResponsesEnabled:         cfg.Features.ResponsesEnabled,
 		EmptyToolTurnRetryModels: cfg.Features.EmptyToolTurnRetryModels,
+		EmptyToolTurnMaxRetries:  cfg.Features.EmptyToolTurnMaxRetries,
+		EmptyToolTurnRetryBudget: cfg.EmptyToolTurnRetryBudgetDur,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -318,6 +322,8 @@ func main() {
 		// 原生 Responses 接口开关经 livecfg 热生效；静态字段同为 Live=nil 兜底。
 		ResponsesEnabled:         cfg.Features.ResponsesEnabled,
 		EmptyToolTurnRetryModels: cfg.Features.EmptyToolTurnRetryModels,
+		EmptyToolTurnMaxRetries:  cfg.Features.EmptyToolTurnMaxRetries,
+		EmptyToolTurnRetryBudget: cfg.EmptyToolTurnRetryBudgetDur,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 	})
@@ -496,6 +502,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		RecordClientInfo:         newCfg.Logging.RequestClientInfo,
 		ResponsesEnabled:         newCfg.Features.ResponsesEnabled,
 		EmptyToolTurnRetryModels: newCfg.Features.EmptyToolTurnRetryModels,
+		EmptyToolTurnMaxRetries:  newCfg.Features.EmptyToolTurnMaxRetries,
+		EmptyToolTurnRetryBudget: newCfg.EmptyToolTurnRetryBudgetDur,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

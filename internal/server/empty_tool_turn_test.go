@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -329,6 +331,7 @@ func newEmptyToolTurnTestUpstream(t *testing.T, next func(int) string, captures 
 	return &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			calls++
+			time.Sleep(time.Millisecond)
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				return nil, err
@@ -349,25 +352,47 @@ func newEmptyToolTurnTestUpstream(t *testing.T, next func(int) string, captures 
 	}
 }
 
-func assertEmptyTurnRequestsWereIdentical(t *testing.T, captured []emptyToolTurnCapturedRequest) {
+func assertEmptyTurnRequestsSwitchedAccount(t *testing.T, captured []emptyToolTurnCapturedRequest) {
 	t.Helper()
 	if len(captured) < 2 {
 		t.Fatalf("captured %d attempts, want at least 2", len(captured))
 	}
+	if captured[0].Authorization == captured[1].Authorization {
+		t.Fatalf("retry reused the same account authorization: %q", captured[0].Authorization)
+	}
+	var firstBody, secondBody map[string]any
+	if err := json.Unmarshal(captured[0].Body, &firstBody); err != nil {
+		t.Fatalf("decode first body: %v", err)
+	}
+	if err := json.Unmarshal(captured[1].Body, &secondBody); err != nil {
+		t.Fatalf("decode second body: %v", err)
+	}
+	firstCacheKey, _ := firstBody["prompt_cache_key"].(string)
+	secondCacheKey, _ := secondBody["prompt_cache_key"].(string)
+	if firstCacheKey == "" || secondCacheKey == "" || firstCacheKey == secondCacheKey {
+		t.Fatalf("account-specific prompt_cache_key not recomputed: %q vs %q", firstCacheKey, secondCacheKey)
+	}
+	delete(firstBody, "prompt_cache_key")
+	delete(secondBody, "prompt_cache_key")
+	normalizedFirst, err := json.Marshal(firstBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalizedSecond, err := json.Marshal(secondBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(normalizedFirst, normalizedSecond) {
+		t.Fatalf("logical request body changed across accounts:\nfirst=%s\nsecond=%s", normalizedFirst, normalizedSecond)
+	}
 	for i := 1; i < len(captured); i++ {
-		if captured[i].Authorization != captured[0].Authorization {
-			t.Errorf("attempt %d used a different account", i+1)
-		}
-		if !bytes.Equal(captured[i].Body, captured[0].Body) {
-			t.Errorf("attempt %d used a different prepared request body", i+1)
-		}
 		if captured[i].TurnRequestID != captured[0].TurnRequestID {
 			t.Errorf("attempt %d changed turn request ID", i+1)
 		}
 	}
 }
 
-func TestChatEmptyToolTurnRetrySameBodyAndAggregatedUsage(t *testing.T) {
+func TestChatEmptyToolTurnRetrySwitchesAccountAndAggregatesUsage(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
 			var captured []emptyToolTurnCapturedRequest
@@ -379,12 +404,17 @@ func TestChatEmptyToolTurnRetrySameBodyAndAggregatedUsage(t *testing.T) {
 				}
 				return emptyToolTurnFixture(t, true, 20, 5, 2, 0.2)
 			}, &captured)
-			p := testPoolWith(&auth.Auth{UID: "retry-account", AccessToken: "test-at", ExpiresAt: 9999999999})
+			p := testPoolWith(
+				&auth.Auth{UID: "retry-a", AccessToken: "test-at-a", ExpiresAt: 9999999999},
+				&auth.Auth{UID: "retry-b", AccessToken: "test-at-b", ExpiresAt: 9999999999},
+			)
 			reqLog := reqlog.New(reqlog.Config{})
 			defer reqLog.Close()
 			h := NewHandler(Config{
 				Pool: p, Upstream: up, RequestLog: reqLog,
 				EmptyToolTurnRetryModels: []string{"*"},
+				EmptyToolTurnMaxRetries:  1,
+				EmptyToolTurnRetryBudget: 75 * time.Second,
 			})
 			body, err := json.Marshal(map[string]any{
 				"model": "deepseek-v4.1-flash", "stream": stream,
@@ -407,10 +437,7 @@ func TestChatEmptyToolTurnRetrySameBodyAndAggregatedUsage(t *testing.T) {
 			if calls != 2 {
 				t.Fatalf("upstream calls=%d want 2", calls)
 			}
-			assertEmptyTurnRequestsWereIdentical(t, captured)
-			if captured[0].Authorization != "Bearer test-at" {
-				t.Fatalf("unexpected account authorization: %q", captured[0].Authorization)
-			}
+			assertEmptyTurnRequestsSwitchedAccount(t, captured)
 			if stream {
 				if !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) ||
 					!strings.Contains(rec.Body.String(), `"prompt_tokens":30`) ||
@@ -442,12 +469,21 @@ func TestChatEmptyToolTurnRetrySameBodyAndAggregatedUsage(t *testing.T) {
 			if event.Attempts != 2 || event.PromptTokens != 30 || event.CompletionTokens != 7 || event.TotalTokens != 37 || len(event.EmptyToolTurnAttempts) != 2 {
 				t.Fatalf("request archive did not aggregate attempts: %+v", event)
 			}
-			if event.EmptyToolTurnAttempts[0].Outcome != "retry" || event.EmptyToolTurnAttempts[1].Outcome != "recovered" || event.EmptyToolTurnAttempts[0].ReasoningTokens != 1 {
+			if event.EmptyToolTurnAttempts[0].Outcome != "retry_account" || event.EmptyToolTurnAttempts[1].Outcome != "recovered" || event.EmptyToolTurnAttempts[0].ReasoningTokens != 1 {
 				t.Fatalf("per-attempt record=%+v", event.EmptyToolTurnAttempts)
 			}
-			status, ok := p.Status("retry-account")
-			if !ok || status.Cooling || status.Disabled || status.ErrTotal != 0 {
-				t.Fatalf("semantic retries penalized the account: %+v", status)
+			if event.EmptyToolTurnAttempts[0].DurationMs <= 0 || event.EmptyToolTurnAttempts[1].DurationMs <= 0 {
+				t.Fatalf("per-attempt durations not recorded: %+v", event.EmptyToolTurnAttempts)
+			}
+			if event.EmptyToolTurnAttempts[0].Account == "" || event.EmptyToolTurnAttempts[1].Account == "" ||
+				event.EmptyToolTurnAttempts[0].Account == event.EmptyToolTurnAttempts[1].Account {
+				t.Fatalf("per-attempt accounts not distinct: %+v", event.EmptyToolTurnAttempts)
+			}
+			for _, uid := range []string{"retry-a", "retry-b"} {
+				status, ok := p.Status(uid)
+				if !ok || status.Cooling || status.Disabled || status.ErrTotal != 0 {
+					t.Fatalf("semantic retries penalized %s: %+v", uid, status)
+				}
 			}
 		})
 	}
@@ -463,12 +499,17 @@ func TestResponsesEmptyToolTurnRetryBuffersAndAggregatesUsage(t *testing.T) {
 		}
 		return emptyToolTurnFixture(t, true, 20, 5, 2, 0.2)
 	}, &captured)
-	p := testPoolWith(&auth.Auth{UID: "responses-retry", AccessToken: "responses-at", ExpiresAt: 9999999999})
+	p := testPoolWith(
+		&auth.Auth{UID: "responses-a", AccessToken: "responses-at-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "responses-b", AccessToken: "responses-at-b", ExpiresAt: 9999999999},
+	)
 	reqLog := reqlog.New(reqlog.Config{})
 	defer reqLog.Close()
 	h := NewHandler(Config{
 		Pool: p, Upstream: up, APIKey: "key", ResponsesEnabled: true, RequestLog: reqLog,
 		EmptyToolTurnRetryModels: []string{"*"},
+		EmptyToolTurnMaxRetries:  1,
+		EmptyToolTurnRetryBudget: 75 * time.Second,
 	})
 	body := `{"model":"deepseek-v4.1-flash","input":"run a tool","stream":true,"store":false,"tools":[{"type":"function","name":"run","parameters":{"type":"object"}}],"tool_choice":"auto"}`
 	r := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -481,7 +522,7 @@ func TestResponsesEmptyToolTurnRetryBuffersAndAggregatesUsage(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("upstream calls=%d want 2", calls)
 	}
-	assertEmptyTurnRequestsWereIdentical(t, captured)
+	assertEmptyTurnRequestsSwitchedAccount(t, captured)
 	if strings.Count(rec.Body.String(), "event: response.created") != 1 || strings.Contains(rec.Body.String(), "reasoning from this attempt") {
 		t.Fatalf("rejected attempt leaked Responses events: %s", rec.Body.String())
 	}
@@ -492,9 +533,12 @@ func TestResponsesEmptyToolTurnRetryBuffersAndAggregatesUsage(t *testing.T) {
 	if event.Attempts != 2 || len(event.EmptyToolTurnAttempts) != 2 || event.TotalTokens != 37 {
 		t.Fatalf("request archive=%+v", event)
 	}
+	if event.EmptyToolTurnAttempts[0].Outcome != "retry_account" || event.EmptyToolTurnAttempts[1].Outcome != "recovered" {
+		t.Fatalf("per-attempt outcomes=%+v", event.EmptyToolTurnAttempts)
+	}
 }
 
-func TestEmptyToolTurnExhaustionStopsAfterThreeRetriesWithoutPenalizingAccount(t *testing.T) {
+func TestEmptyToolTurnExhaustionStopsAfterOneAccountSwitchWithoutPenalizingAccounts(t *testing.T) {
 	for _, route := range []string{"/v1/chat/completions", "/v1/responses"} {
 		t.Run(route, func(t *testing.T) {
 			var captured []emptyToolTurnCapturedRequest
@@ -503,12 +547,17 @@ func TestEmptyToolTurnExhaustionStopsAfterThreeRetriesWithoutPenalizingAccount(t
 				calls++
 				return emptyToolTurnFixture(t, false, 10, 2, 1, 0.1)
 			}, &captured)
-			p := testPoolWith(&auth.Auth{UID: "exhausted", AccessToken: "exhausted-at", ExpiresAt: 9999999999})
+			p := testPoolWith(
+				&auth.Auth{UID: "exhausted-a", AccessToken: "exhausted-at-a", ExpiresAt: 9999999999},
+				&auth.Auth{UID: "exhausted-b", AccessToken: "exhausted-at-b", ExpiresAt: 9999999999},
+			)
 			reqLog := reqlog.New(reqlog.Config{})
 			defer reqLog.Close()
 			h := NewHandler(Config{
 				Pool: p, Upstream: up, APIKey: "key", ResponsesEnabled: true, RequestLog: reqLog,
 				EmptyToolTurnRetryModels: []string{"cn:deepseek-v4.1-flash"},
+				EmptyToolTurnMaxRetries:  1,
+				EmptyToolTurnRetryBudget: 75 * time.Second,
 			})
 			var body string
 			if route == "/v1/responses" {
@@ -520,25 +569,157 @@ func TestEmptyToolTurnExhaustionStopsAfterThreeRetriesWithoutPenalizingAccount(t
 			r.Header.Set("Authorization", "Bearer key")
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, r)
-			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "upstream_empty_tool_turn") {
-				t.Fatalf("status=%d body=%s want 502 upstream_empty_tool_turn", rec.Code, rec.Body.String())
+			if rec.Code != http.StatusGatewayTimeout || !strings.Contains(rec.Body.String(), "upstream_empty_tool_turn") {
+				t.Fatalf("status=%d body=%s want 504 upstream_empty_tool_turn", rec.Code, rec.Body.String())
 			}
-			if calls != 4 || len(captured) != 4 {
-				t.Fatalf("upstream calls=%d captured=%d want 4 (original + 3 retries)", calls, len(captured))
+			if calls != 2 || len(captured) != 2 {
+				t.Fatalf("upstream calls=%d captured=%d want 2 (original + 1 account switch)", calls, len(captured))
 			}
-			assertEmptyTurnRequestsWereIdentical(t, captured)
+			assertEmptyTurnRequestsSwitchedAccount(t, captured)
 			if strings.Contains(rec.Body.String(), "reasoning from this attempt") || strings.Contains(rec.Body.String(), "response.created") {
 				t.Fatalf("failed attempt body leaked to client: %s", rec.Body.String())
 			}
-			status, ok := p.Status("exhausted")
-			if !ok || status.Cooling || status.Disabled || status.ErrTotal != 0 {
-				t.Fatalf("empty tool turn penalized the account: %+v", status)
+			for _, uid := range []string{"exhausted-a", "exhausted-b"} {
+				status, ok := p.Status(uid)
+				if !ok || status.Cooling || status.Disabled || status.ErrTotal != 0 {
+					t.Fatalf("empty tool turn penalized %s: %+v", uid, status)
+				}
 			}
 			event := reqLog.Snapshot().Recent[0]
-			if event.Attempts != 4 || len(event.EmptyToolTurnAttempts) != 4 || event.EmptyToolTurnAttempts[3].Outcome != "exhausted" {
+			if event.Attempts != 2 || len(event.EmptyToolTurnAttempts) != 2 ||
+				event.EmptyToolTurnAttempts[0].Outcome != "retry_account" ||
+				event.EmptyToolTurnAttempts[1].Outcome != "exhausted" {
 				t.Fatalf("attempt history=%+v", event)
 			}
 		})
+	}
+}
+
+func TestEmptyToolTurnMaxRetriesZeroReturns504WithoutSwitching(t *testing.T) {
+	var captured []emptyToolTurnCapturedRequest
+	calls := 0
+	up := newEmptyToolTurnTestUpstream(t, func(int) string {
+		calls++
+		return emptyToolTurnFixture(t, false, 10, 2, 1, 0.1)
+	}, &captured)
+	p := testPoolWith(
+		&auth.Auth{UID: "zero-a", AccessToken: "zero-at-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "zero-b", AccessToken: "zero-at-b", ExpiresAt: 9999999999},
+	)
+	reqLog := reqlog.New(reqlog.Config{})
+	defer reqLog.Close()
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, RequestLog: reqLog,
+		EmptyToolTurnRetryModels: []string{"*"},
+		EmptyToolTurnMaxRetries:  0,
+		EmptyToolTurnRetryBudget: 75 * time.Second,
+	})
+	body := `{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"run"}],"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object"}}}],"tool_choice":"auto"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusGatewayTimeout || !strings.Contains(rec.Body.String(), "upstream_empty_tool_turn") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls != 1 || len(captured) != 1 {
+		t.Fatalf("calls=%d captured=%d want one attempt", calls, len(captured))
+	}
+	event := reqLog.Snapshot().Recent[0]
+	if event.Attempts != 1 || len(event.EmptyToolTurnAttempts) != 1 || event.EmptyToolTurnAttempts[0].Outcome != "exhausted" {
+		t.Fatalf("attempt history=%+v", event)
+	}
+}
+
+func TestEmptyToolTurnReturnsNoAlternateAccountWithoutSecondCall(t *testing.T) {
+	var captured []emptyToolTurnCapturedRequest
+	calls := 0
+	up := newEmptyToolTurnTestUpstream(t, func(int) string {
+		calls++
+		return emptyToolTurnFixture(t, false, 10, 2, 1, 0.1)
+	}, &captured)
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "only-at", ExpiresAt: 9999999999})
+	reqLog := reqlog.New(reqlog.Config{})
+	defer reqLog.Close()
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, RequestLog: reqLog,
+		EmptyToolTurnRetryModels: []string{"*"},
+		EmptyToolTurnMaxRetries:  1,
+		EmptyToolTurnRetryBudget: 75 * time.Second,
+	})
+	body := `{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"run"}],"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object"}}}],"tool_choice":"auto"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls != 1 || len(captured) != 1 {
+		t.Fatalf("calls=%d captured=%d want one attempt", calls, len(captured))
+	}
+	event := reqLog.Snapshot().Recent[0]
+	if event.Attempts != 1 || len(event.EmptyToolTurnAttempts) != 1 || event.EmptyToolTurnAttempts[0].Outcome != "no_alternate_account" {
+		t.Fatalf("attempt history=%+v", event)
+	}
+}
+
+func TestEmptyToolTurnRetryStateHonorsBudgetAndDeadline(t *testing.T) {
+	now := time.Now()
+	state := emptyToolTurnRetryState{
+		maxRetries: 1,
+		deadline:   now.Add(10 * time.Second),
+	}
+	if canRetry, outcome := state.canRetry(now, true); canRetry || outcome != "deadline" {
+		t.Fatalf("canRetry=%v outcome=%s want deadline", canRetry, outcome)
+	}
+	state.deadline = now.Add(30 * time.Second)
+	if canRetry, outcome := state.canRetry(now, true); !canRetry || outcome != "retry_account" {
+		t.Fatalf("canRetry=%v outcome=%s want retry_account", canRetry, outcome)
+	}
+	state.markRetry()
+	ctx, cancel, local := state.attemptContext(context.Background(), now)
+	defer cancel()
+	if !local {
+		t.Fatal("retry attempt must use the local budget deadline")
+	}
+	if deadline, ok := ctx.Deadline(); !ok || !deadline.Equal(state.deadline) {
+		t.Fatalf("attempt deadline=%v ok=%v want %v", deadline, ok, state.deadline)
+	}
+}
+
+func TestEmptyToolTurnRetryUnbindsStickyAccountAndBindsRecoveredAccount(t *testing.T) {
+	var captured []emptyToolTurnCapturedRequest
+	calls := 0
+	up := newEmptyToolTurnTestUpstream(t, func(int) string {
+		calls++
+		if calls == 1 {
+			return emptyToolTurnFixture(t, false, 10, 2, 1, 0.1)
+		}
+		return emptyToolTurnFixture(t, true, 20, 5, 2, 0.2)
+	}, &captured)
+	store := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     store,
+		Available: func() []string { return []string{"sticky-a", "sticky-b"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "sticky-a", AccessToken: "sticky-at-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "sticky-b", AccessToken: "sticky-at-b", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, Session: sess,
+		EmptyToolTurnRetryModels: []string{"*"},
+		EmptyToolTurnMaxRetries:  1,
+		EmptyToolTurnRetryBudget: 75 * time.Second,
+	})
+	sess.Bind("conv-empty", "sticky-a")
+	body := `{"model":"deepseek-v4.1-flash","stream":false,"messages":[{"role":"user","content":"run"}],"metadata":{"conversation_id":"conv-empty"},"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object"}}}],"tool_choice":"auto"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	assertEmptyTurnRequestsSwitchedAccount(t, captured)
+	if uid, ok := store.lastUID("conv-empty"); !ok || uid != "sticky-b" {
+		t.Fatalf("sticky binding=%q ok=%v want sticky-b (binds=%v)", uid, ok, store.binds)
 	}
 }
 

@@ -991,6 +991,8 @@ const CFG_MAP = {
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   responses_enabled: ['features', 'responses_enabled'],
   empty_tool_turn_retry_models: ['features', 'empty_tool_turn_retry_models'],
+  empty_tool_turn_max_retries: ['features', 'empty_tool_turn_max_retries'],
+  empty_tool_turn_retry_budget: ['features', 'empty_tool_turn_retry_budget'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
@@ -1058,7 +1060,8 @@ function collectConfig() {
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl',
+  'empty_tool_turn_retry_budget'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
   const el = $('cfgForm').elements[name];
