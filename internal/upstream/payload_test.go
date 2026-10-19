@@ -465,3 +465,76 @@ func TestClampGPTMinMaxTokens(t *testing.T) {
 		})
 	}
 }
+
+func TestDropUnsupportedReasoningContentParts(t *testing.T) {
+	t.Run("drop reasoning text and keep text", func(t *testing.T) {
+		body := []byte(`{"messages":[{"role":"user","content":[
+			{"type":"reasoning_text","text":"must not replay"},
+			{"type":"text","text":"continue"}]}]}`)
+		out := PrepareBodyOptWithEfforts(body, false, nil)
+		if strings.Contains(string(out), "must not replay") || strings.Contains(string(out), "reasoning_text") {
+			t.Fatalf("reasoning leaked: %s", out)
+		}
+		obj, err := decodeBody(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages := obj["messages"].([]any)
+		if len(messages) != 1 {
+			t.Fatalf("messages=%#v", messages)
+		}
+		parts := messages[0].(map[string]any)["content"].([]any)
+		if len(parts) != 1 || parts[0].(map[string]any)["type"] != "text" {
+			t.Fatalf("content=%#v", parts)
+		}
+	})
+
+	t.Run("drop reasoning-only message", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":[{"type":"reasoning_text","text":"opaque"}]},
+			{"role":"user","content":"continue"}]}`)
+		out := PrepareBodyOptWithEfforts(body, false, nil)
+		obj, err := decodeBody(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages := obj["messages"].([]any)
+		if len(messages) != 1 || messages[0].(map[string]any)["content"] != "continue" {
+			t.Fatalf("messages=%#v", messages)
+		}
+	})
+
+	t.Run("preserve tool call with null content", func(t *testing.T) {
+		body := []byte(`{"messages":[{"role":"assistant","content":[
+			{"type":"reasoning_text","text":"opaque"}],
+			"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}]}`)
+		out := PrepareBodyOptWithEfforts(body, false, nil)
+		obj, err := decodeBody(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages := obj["messages"].([]any)
+		if len(messages) != 2 {
+			t.Fatalf("messages=%#v", messages)
+		}
+		message := messages[0].(map[string]any)
+		if message["content"] != nil || message["tool_calls"] == nil {
+			t.Fatalf("message=%#v", message)
+		}
+	})
+
+	t.Run("leave normal content untouched", func(t *testing.T) {
+		body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"keep"}]}]}`)
+		out := PrepareBodyOptWithEfforts(body, true, nil)
+		obj, err := decodeBody(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages := obj["messages"].([]any)
+		parts := messages[0].(map[string]any)["content"].([]any)
+		if len(parts) != 1 || parts[0].(map[string]any)["text"] != "keep" {
+			t.Fatalf("content=%#v", parts)
+		}
+	})
+}

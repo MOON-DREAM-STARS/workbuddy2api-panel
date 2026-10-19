@@ -2,6 +2,7 @@
 //  1. 强制 stream:true（上游拒绝非流式）
 //  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101）
 //  3. image_url 归一化（上游只认 OpenAI 对象形态，字符串会 400 code=11101）
+//  4. 剔除 Responses→Chat 转换可能残留的 reasoning_text 内容块
 package upstream
 
 import (
@@ -51,6 +52,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	normalizeToolChoice(obj)
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
+	dropUnsupportedReasoningContentParts(obj)
 	normalizeImageURL(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
@@ -251,6 +253,78 @@ func normalizeRoles(obj map[string]any) {
 			msg["role"] = "system"
 			log.Printf("role normalized developer->system idx=%d", i)
 		}
+	}
+}
+
+// dropUnsupportedReasoningContentParts 删除 Chat messages.content 中
+// Responses 风格的 reasoning_text 块。NewAPI 的 Responses→Chat 转换器会把
+// reasoning 项转成一条默认 user 消息，并把 content 原样留给 WorkBuddy；上游
+// 只接受 text/image_url 等已知 Chat 内容块，遇到该类型会返回：
+//
+//	400 code=11101 Parse message failed: unsupported content type ... reasoning_text
+//
+// 历史思考不应作为正文重放。只含该块的消息整条删除；assistant 消息若还有
+// tool_calls/function_call，则保留消息与调用，把 content 置为 null。
+func dropUnsupportedReasoningContentParts(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	out := make([]any, 0, len(msgs))
+	droppedParts, droppedMessages := 0, 0
+	for _, rawMsg := range msgs {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			out = append(out, rawMsg)
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			out = append(out, msg)
+			continue
+		}
+
+		filtered := make([]any, 0, len(parts))
+		changed := false
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			partType, _ := part["type"].(string)
+			if ok && strings.EqualFold(strings.TrimSpace(partType), "reasoning_text") {
+				changed = true
+				droppedParts++
+				continue
+			}
+			filtered = append(filtered, rawPart)
+		}
+		if !changed {
+			out = append(out, msg)
+			continue
+		}
+		if len(filtered) > 0 {
+			msg["content"] = filtered
+			out = append(out, msg)
+			continue
+		}
+		if _, hasCalls := msg["tool_calls"]; hasCalls {
+			msg["content"] = nil
+			out = append(out, msg)
+			continue
+		}
+		if _, hasCall := msg["function_call"]; hasCall {
+			msg["content"] = nil
+			out = append(out, msg)
+			continue
+		}
+		if role, _ := msg["role"].(string); strings.EqualFold(strings.TrimSpace(role), "tool") {
+			msg["content"] = ""
+			out = append(out, msg)
+			continue
+		}
+		droppedMessages++
+	}
+	obj["messages"] = out
+	if droppedParts > 0 {
+		log.Printf("dropped unsupported reasoning_text content parts=%d empty_messages=%d", droppedParts, droppedMessages)
 	}
 }
 
