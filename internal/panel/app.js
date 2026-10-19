@@ -989,6 +989,8 @@ const CFG_MAP = {
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
+  responses_enabled: ['features', 'responses_enabled'],
+  empty_tool_turn_retry_models: ['features', 'empty_tool_turn_retry_models'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
@@ -1023,7 +1025,7 @@ async function loadConfig() {
       if (!el) continue;
       const v = dig(cfgLoaded, path);
       if (el.type === 'checkbox') el.checked = !!v;
-      else if (Array.isArray(v)) el.value = v.join(', ');
+      else if (Array.isArray(v)) el.value = name === 'empty_tool_turn_retry_models' ? v.join('\n') : v.join(', ');
       else el.value = v == null ? '' : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
@@ -1041,7 +1043,8 @@ function collectConfig() {
     else {
       const raw = el.value.trim();
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
-      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
+      if (name === 'empty_tool_turn_retry_models') v = raw === '' ? [] : raw.split(/[,，\n\r\s]+/).filter(Boolean);
+      else if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }

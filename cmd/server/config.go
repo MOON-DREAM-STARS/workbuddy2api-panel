@@ -152,6 +152,14 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// ResponsesEnabled 原生 Responses 接口开关，缺省 false = 仅提供 Chat API
+		// （/v1/chat/completions）。关闭时 POST /v1/responses 在鉴权之前统一返回
+		// 404（code=endpoint_disabled）；开启后恢复无状态 Responses 子集。
+		// 热生效（经 livecfg 快照），面板保存即时生效，无需重启。
+		ResponsesEnabled bool `json:"responses_enabled"`
+		// EmptyToolTurnRetryModels 对指定模型启用 stop + 无合法工具调用时的
+		// 有界同账号重试。缺省 ["*"] 表示所有模型；模型 ID 可带 cn:/global: 前缀。
+		EmptyToolTurnRetryModels []string `json:"empty_tool_turn_retry_models"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -272,6 +280,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.EmptyToolTurnRetryModels = []string{"*"}
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -453,6 +462,7 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	c.Features.EmptyToolTurnRetryModels = normalizeModelNames(c.Features.EmptyToolTurnRetryModels)
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
@@ -595,6 +605,26 @@ func (c *Config) normalize() error {
 		return err
 	}
 	return c.normalizePrompt()
+}
+
+func normalizeModelNames(models []string) []string {
+	if len(models) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		out = append(out, model)
+	}
+	return out
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

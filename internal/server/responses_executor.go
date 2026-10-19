@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,7 @@ type ChatRenderMeta struct {
 	ReqHasImage bool
 	ChatMeta    upstream.ChatMeta
 	Started     time.Time
+	PriorUsage  map[string]any
 }
 
 type ChatOutcome struct {
@@ -96,6 +98,7 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 	}
 
 	realm, bareModel := resolveModel(req.Model)
+	emptyToolRetryEnabled := h.emptyToolTurnRetryEnabled(req.Model, req.Body)
 	st := newChatStat(time.Now(), req.Body, req.Stream)
 	if trace := requestTraceFromContext(ctx); trace != nil {
 		trace.stat = st
@@ -220,7 +223,99 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 			}
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(ctx, acct, req.Body, req.ClientIP, chatMeta)
+		preparedBody := []byte(nil)
+		if emptyToolRetryEnabled {
+			preparedBody = h.cfg.Upstream.PrepareChatBody(acct, req.Body, chatMeta)
+		}
+		retryCount := 0
+		var retryUsage map[string]any
+		var bufferedStats *chatStatsReader
+		var finalObservation *upstream.EmptyToolTurnObservation
+		var rc io.ReadCloser
+		var status int
+		var respBody []byte
+		var terr error
+		for {
+			attemptStarted = time.Now()
+			if emptyToolRetryEnabled {
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamPreparedContext(ctx, acct, preparedBody, req.ClientIP, chatMeta)
+			} else {
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(ctx, acct, req.Body, req.ClientIP, chatMeta)
+			}
+			if terr != nil || status >= 400 || !emptyToolRetryEnabled {
+				break
+			}
+			bufferedStats = newChatStatsReaderSince(rc, attemptStarted)
+			raw, readErr := readValidatedResponse(bufferedStats)
+			_ = rc.Close()
+			if errors.Is(readErr, errValidatedResponseTooLarge) {
+				credit, hasCredit := bufferedStats.Credit()
+				delta := bufferedStats.Usage()
+				recordResponsesUsage(h, st, acct.UID, bareModel, delta, credit, hasCredit, attemptStarted)
+				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
+				releaseHeld()
+				return ChatOutcome{Status: http.StatusBadGateway}, &chatFailure{
+					Status: http.StatusBadGateway, Code: "upstream_validation_limit",
+					Message: "upstream response exceeded the 8 MiB validation buffer",
+				}
+			}
+			if readErr != nil {
+				credit, hasCredit := bufferedStats.Credit()
+				delta := bufferedStats.Usage()
+				recordResponsesUsage(h, st, acct.UID, bareModel, delta, credit, hasCredit, attemptStarted)
+				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeStreamError
+				releaseHeld()
+				return ChatOutcome{Status: http.StatusBadGateway}, &chatFailure{
+					Status: http.StatusBadGateway, Code: "upstream_parse",
+					Message: "upstream response could not be buffered for validation",
+				}
+			}
+			rc = io.NopCloser(bytes.NewReader(raw))
+			observation, inspectErr := upstream.InspectEmptyToolTurn(raw, req.Body)
+			if inspectErr != nil {
+				break // renderer 保留原有解析/终态错误语义
+			}
+			finalObservation = &observation
+			if !observation.EmptyToolTurnCandidate() {
+				if retryCount > 0 {
+					result := "terminal_" + observation.EmptyToolTurnTerminalReason()
+					if observation.ValidToolCalls > 0 {
+						result = "recovered"
+					}
+					recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname), retryCount+1, result, observation.Response)
+				}
+				break
+			}
+
+			usage := usageMap(observation.Response)
+			if usage != nil {
+				st.cacheHit, st.cacheMiss, st.hasCache = 0, 0, false
+				if hit, ok := upstream.UsageCacheHitTokens(usage); ok {
+					miss, _ := upstream.UsageCacheMissTokens(usage)
+					st.cacheHit, st.cacheMiss, st.hasCache = int64(hit), int64(miss), true
+				}
+				retryUsage = mergeUsageMaps(retryUsage, usage)
+			}
+			fillStatFromUsageCompat(st, observation.Response)
+			credit, total, hasCredit := usageCreditTotal(observation.Response)
+			recordResponsesUsage(h, st, acct.UID, bareModel, usageDeltaFromResponse(observation.Response), credit, hasCredit, attemptStarted)
+			if hasCredit {
+				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			}
+			attemptNumber := retryCount + 1
+			if retryCount >= emptyToolTurnMaxRetries {
+				recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname), attemptNumber, "exhausted", observation.Response)
+				applyUsageToChatStat(st, retryUsage)
+				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
+				releaseHeld()
+				return ChatOutcome{Status: http.StatusBadGateway}, &chatFailure{
+					Status: http.StatusBadGateway, Code: "upstream_empty_tool_turn",
+					Message: "upstream repeatedly ended a tool-enabled turn without a valid function call",
+				}
+			}
+			recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname), attemptNumber, "retry", observation.Response)
+			retryCount++
+		}
 		var uerr *upstream.Error
 		if errors.As(terr, &uerr) {
 			status = uerr.Status
@@ -309,7 +404,11 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 			continue
 		}
 
-		meta := ChatRenderMeta{Account: acct, BareModel: bareModel, Realm: realm, ReqHasImage: reqHasImage, ChatMeta: chatMeta, Started: st.start}
+		priorUsage := retryUsage
+		if finalObservation == nil || !finalObservation.SawDone || finalObservation.SawErrorFrame {
+			priorUsage = nil
+		}
+		meta := ChatRenderMeta{Account: acct, BareModel: bareModel, Realm: realm, ReqHasImage: reqHasImage, ChatMeta: chatMeta, Started: st.start, PriorUsage: priorUsage}
 		var out ChatOutcome
 		if req.Stream {
 			out = renderer.RenderStream(ctx, rc, meta)
@@ -319,6 +418,9 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 		_ = rc.Close()
 		if out.Status == 0 {
 			out.Status = http.StatusOK
+		}
+		if bufferedStats != nil {
+			out.TTFB = bufferedStats.TTFB()
 		}
 		// A 200 transport is not sufficient to declare the account healthy: the
 		// upstream can emit an error frame or end before [DONE]. Keep the Panel
@@ -372,6 +474,9 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 		}
 		if !recordedUsage {
 			recordResponsesUsage(h, st, acct.UID, bareModel, pool.TokenUsageDelta{}, 0, false, attemptStarted)
+		}
+		if retryCount > 0 && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame {
+			applyUsageToChatStat(st, mergeUsageMaps(retryUsage, usageMap(finalObservation.Response)))
 		}
 		return out, nil
 	}
@@ -512,6 +617,9 @@ func recordResponsesUsage(h *Handler, st *chatStat, uid, model string, delta poo
 		return
 	}
 	delta.Model = model
+	if st != nil {
+		st.attempts++
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		realm, bare := resolveModel(model)

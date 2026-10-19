@@ -228,15 +228,22 @@ func main() {
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
 	}
+	if cfg.Features.ResponsesEnabled {
+		log.Printf("原生 Responses 接口已启用（features.responses_enabled=true）：/v1/responses 无状态兼容子集可用")
+	} else {
+		log.Printf("原生 Responses 接口关闭（缺省，features.responses_enabled=false）：仅提供 /v1/chat/completions；面板可热开启")
+	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		APIKey:                   cfg.APIKey,
+		SoftCooldown:             cfg.SoftRateDur,
+		SanitizeFingerprints:     cfg.Features.SanitizeBlacklistFingerprints,
+		RecordClientInfo:         cfg.Logging.RequestClientInfo,
+		ResponsesEnabled:         cfg.Features.ResponsesEnabled,
+		EmptyToolTurnRetryModels: cfg.Features.EmptyToolTurnRetryModels,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -308,6 +315,9 @@ func main() {
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		// 原生 Responses 接口开关经 livecfg 热生效；静态字段同为 Live=nil 兜底。
+		ResponsesEnabled:         cfg.Features.ResponsesEnabled,
+		EmptyToolTurnRetryModels: cfg.Features.EmptyToolTurnRetryModels,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 	})
@@ -480,10 +490,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		APIKey:                   newCfg.APIKey,
+		SoftCooldown:             newCfg.SoftRateDur,
+		SanitizeFingerprints:     newCfg.Features.SanitizeBlacklistFingerprints,
+		RecordClientInfo:         newCfg.Logging.RequestClientInfo,
+		ResponsesEnabled:         newCfg.Features.ResponsesEnabled,
+		EmptyToolTurnRetryModels: newCfg.Features.EmptyToolTurnRetryModels,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

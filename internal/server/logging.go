@@ -3,6 +3,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -342,13 +343,30 @@ type requestTraceKey struct{}
 
 // requestTrace 在一次 chat 请求内共享标识与最终统计，ServeHTTP 出口统一记账。
 type requestTrace struct {
-	id    string
-	path  string
-	start time.Time
-	stat  *chatStat
+	id                    string
+	path                  string
+	start                 time.Time
+	stat                  *chatStat
+	emptyToolTurnAttempts []reqlog.EmptyToolTurnAttempt
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
+}
+
+func recordEmptyToolTurnAttempt(ctx context.Context, model, account string, attempt int, outcome string, response map[string]any) {
+	usage := usageMap(response)
+	prompt, completion, total, hit, miss, reasoning, credit, hasUsage, hasCredit := attemptUsageDetails(usage)
+	summary := reqlog.EmptyToolTurnAttempt{
+		Attempt: attempt, Outcome: outcome,
+		PromptTokens: prompt, CompletionTokens: completion, TotalTokens: total,
+		CacheHitTokens: hit, CacheMissTokens: miss, ReasoningTokens: reasoning,
+		Credit: credit, HasCredit: hasCredit, HasUsage: hasUsage,
+	}
+	if trace := requestTraceFromContext(ctx); trace != nil {
+		trace.emptyToolTurnAttempts = append(trace.emptyToolTurnAttempts, summary)
+	}
+	log.Printf("INFO: [server] empty_tool_turn acct=%s model=%s attempt=%d outcome=%s usage=%t prompt=%d completion=%d total=%d cache_hit=%d cache_miss=%d reasoning=%d credit_known=%t credit=%.6f",
+		account, model, attempt, outcome, hasUsage, prompt, completion, total, hit, miss, reasoning, hasCredit, credit)
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -428,6 +446,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
 	}
+	e.EmptyToolTurnAttempts = append([]reqlog.EmptyToolTurnAttempt(nil), t.emptyToolTurnAttempts...)
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
 	if e.Outcome == "" {

@@ -80,10 +80,28 @@ type Event struct {
 	HasCredit        bool      `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens        int64                  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens       int64                  `json:"cache_miss_tokens,omitempty"`
+	EmptyToolTurnAttempts []EmptyToolTurnAttempt `json:"empty_tool_turn_attempts,omitempty"`
+	ClientIP              string                 `json:"client_ip,omitempty"`
+	UserAgent             string                 `json:"user_agent,omitempty"`
+}
+
+// EmptyToolTurnAttempt is a bounded, body-free usage/result record for one
+// opted-in semantic retry attempt. It intentionally contains no prompt,
+// response text, account ID, or credential material.
+type EmptyToolTurnAttempt struct {
+	Attempt          int     `json:"attempt"`
+	Outcome          string  `json:"outcome"`
+	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty"`
+	TotalTokens      int64   `json:"total_tokens,omitempty"`
+	CacheHitTokens   int64   `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens  int64   `json:"cache_miss_tokens,omitempty"`
+	ReasoningTokens  int64   `json:"reasoning_tokens,omitempty"`
+	Credit           float64 `json:"credit,omitempty"`
+	HasCredit        bool    `json:"credit_known"`
+	HasUsage         bool    `json:"usage_known"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

@@ -95,6 +95,7 @@ func parseResponsesRequest(raw []byte) (responsesRequest, error) {
 		"metadata": true, "prompt_cache_key": true, "tools": true,
 		"tool_choice": true, "parallel_tool_calls": true, "reasoning": true,
 		"text": true, "background": true, "client_metadata": true, "include": true,
+		"service_tier": true, "stream_options": true,
 	}
 	unknown := make([]string, 0)
 	for key := range req {
@@ -121,6 +122,40 @@ func parseResponsesRequest(raw []byte) (responsesRequest, error) {
 		// This is request metadata for Codex clients, not a WorkBuddy Chat
 		// control. Accept it explicitly but never copy it into ChatBody.
 		out.ClientMetadata = v
+	}
+	if v, exists := req["service_tier"]; exists && v != nil {
+		tier, ok := v.(string)
+		if !ok {
+			return responsesRequest{}, responseBad("service_tier", "must be a string or null")
+		}
+		if tier != "" && tier != "default" {
+			return responsesRequest{}, responseUnsupported("service_tier", "non-default service tiers are not supported by this gateway")
+		}
+	}
+	if v, exists := req["stream_options"]; exists && v != nil {
+		options, ok := v.(map[string]any)
+		if !ok {
+			return responsesRequest{}, responseBad("stream_options", "must be an object or null")
+		}
+		unknownOptions := make([]string, 0)
+		for key := range options {
+			if key != "reasoning_summary_delivery" {
+				unknownOptions = append(unknownOptions, key)
+			}
+		}
+		if len(unknownOptions) > 0 {
+			sort.Strings(unknownOptions)
+			return responsesRequest{}, responseUnsupported("stream_options."+unknownOptions[0], "only reasoning_summary_delivery is supported")
+		}
+		if v, exists := options["reasoning_summary_delivery"]; exists && v != nil {
+			delivery, ok := v.(string)
+			if !ok {
+				return responsesRequest{}, responseBad("stream_options.reasoning_summary_delivery", "must be sequential_cutoff")
+			}
+			if delivery != "sequential_cutoff" {
+				return responsesRequest{}, responseUnsupported("stream_options.reasoning_summary_delivery", "only sequential_cutoff is supported")
+			}
+		}
 	}
 	if v, exists := req["include"]; exists {
 		items, ok := v.([]any)
@@ -221,8 +256,17 @@ func parseResponsesRequest(raw []byte) (responsesRequest, error) {
 			return responsesRequest{}, responseBad("reasoning", "must be an object")
 		}
 		for key := range m {
-			if key != "effort" && key != "summary" {
-				return responsesRequest{}, responseUnsupported("reasoning."+key, "only effort and summary are supported")
+			if key != "effort" && key != "summary" && key != "context" {
+				return responsesRequest{}, responseUnsupported("reasoning."+key, "only effort, summary, and all_turns context are supported")
+			}
+		}
+		if v, exists := m["context"]; exists && v != nil {
+			context, ok := v.(string)
+			if !ok {
+				return responsesRequest{}, responseBad("reasoning.context", "must be all_turns")
+			}
+			if context != "all_turns" {
+				return responsesRequest{}, responseUnsupported("reasoning.context", "only all_turns is supported by this stateless gateway")
 			}
 		}
 		if v, ok := m["effort"]; ok && v != nil {
@@ -801,6 +845,7 @@ type responseState struct {
 	validEvents     int
 	upstreamErr     map[string]any
 	usage           map[string]any
+	priorUsage      map[string]any
 	decodeErr       error
 }
 
@@ -1306,6 +1351,9 @@ func (s *responseState) finish(sawDone bool, decodeErr error) {
 		output = append(output, item)
 	}
 	s.response["output"] = output
+	if s.priorUsage != nil {
+		s.response["usage"] = responsesUsage(mergeUsageMaps(s.priorUsage, s.usage))
+	}
 	if s.encoder != nil {
 		s.emitItemDoneEvents()
 		terminalEvent := "response.completed"
@@ -1493,6 +1541,7 @@ type responsesRenderer struct {
 
 func (r *responsesRenderer) RenderStream(_ context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {
 	state, stats, decoded := decodeResponsesUpstream(r.req, rc, meta.Started, r.encoder)
+	state.priorUsage = meta.PriorUsage
 	state.finish(decoded.SawDone, decoded.Err)
 	out := state.outcome()
 	out.TTFB = stats.TTFB()
@@ -1502,8 +1551,9 @@ func (r *responsesRenderer) RenderStream(_ context.Context, rc io.ReadCloser, me
 	return out
 }
 
-func (r *responsesRenderer) RenderNonStream(_ context.Context, rc io.ReadCloser, _ ChatRenderMeta) ChatOutcome {
+func (r *responsesRenderer) RenderNonStream(_ context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {
 	state, _, decoded := decodeResponsesUpstream(r.req, rc, time.Time{}, nil)
+	state.priorUsage = meta.PriorUsage
 	state.finish(decoded.SawDone, decoded.Err)
 	out := state.outcome()
 	if decoded.Err != nil {

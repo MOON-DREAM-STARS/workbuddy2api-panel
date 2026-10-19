@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 func TestResponsesStrictSubsetAndHistory(t *testing.T) {
@@ -297,6 +299,83 @@ func TestResponsesClientMetadataIsCompatibilityOnly(t *testing.T) {
 	}
 	if _, ok := chat["include"]; ok {
 		t.Fatal("include must not be forwarded to the Chat upstream")
+	}
+}
+
+func TestResponsesCodexCompatibilityFields(t *testing.T) {
+	req, err := parseResponsesRequest([]byte(`{"model":"m","input":"hello","instructions":"Follow the task","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"auto","parallel_tool_calls":true,"reasoning":{"effort":"high","summary":"detailed","context":"all_turns"},"store":false,"stream":true,"stream_options":{"reasoning_summary_delivery":"sequential_cutoff"},"include":["reasoning.encrypted_content"],"prompt_cache_key":"codex-session","text":{"verbosity":"medium"},"client_metadata":{"x-codex-installation-id":"synthetic"},"service_tier":"default"}`))
+	if err != nil {
+		t.Fatalf("Codex Responses compatibility fields should be accepted: %v", err)
+	}
+	if req.ReasoningEffort != "high" || req.ReasoningSummary != "detailed" || !req.Stream {
+		t.Fatalf("unexpected parsed Codex request: %+v", req)
+	}
+
+	var chat map[string]any
+	if err := json.Unmarshal(req.ChatBody, &chat); err != nil {
+		t.Fatalf("decode ChatBody: %v", err)
+	}
+	for _, key := range []string{"stream_options", "service_tier", "client_metadata", "include"} {
+		if _, exists := chat[key]; exists {
+			t.Errorf("Responses compatibility field %q leaked into ChatBody", key)
+		}
+	}
+	if strings.Contains(string(req.ChatBody), `"all_turns"`) {
+		t.Fatal("reasoning.context leaked into ChatBody")
+	}
+
+	prepared := upstream.PrepareBodyOptWithEffortsAndDefault(req.ChatBody, false, nil, nil)
+	var outbound map[string]any
+	if err := json.Unmarshal(prepared, &outbound); err != nil {
+		t.Fatalf("decode prepared Chat request: %v", err)
+	}
+	streamOptions, ok := outbound["stream_options"].(map[string]any)
+	if !ok || streamOptions["include_usage"] != true {
+		t.Fatalf("outbound stream_options=%#v want include_usage=true", outbound["stream_options"])
+	}
+}
+
+func TestResponsesCodexCompatibilityFieldValidation(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		param string
+	}{
+		{
+			name:  "stream options must be object",
+			body:  `{"model":"m","input":"hello","stream_options":true}`,
+			param: "stream_options",
+		},
+		{
+			name:  "unsupported stream option",
+			body:  `{"model":"m","input":"hello","stream_options":{"include_usage":true}}`,
+			param: "stream_options.include_usage",
+		},
+		{
+			name:  "unsupported summary delivery",
+			body:  `{"model":"m","input":"hello","stream_options":{"reasoning_summary_delivery":"concurrent"}}`,
+			param: "stream_options.reasoning_summary_delivery",
+		},
+		{
+			name:  "non-default service tier",
+			body:  `{"model":"m","input":"hello","service_tier":"priority"}`,
+			param: "service_tier",
+		},
+		{
+			name:  "unsupported reasoning context",
+			body:  `{"model":"m","input":"hello","reasoning":{"context":"current_turn"}}`,
+			param: "reasoning.context",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseResponsesRequest([]byte(tc.body))
+			validation, ok := err.(*responsesValidationError)
+			if !ok || validation.Param != tc.param {
+				t.Fatalf("error=%T %#v want param %q", err, err, tc.param)
+			}
+		})
 	}
 }
 
@@ -587,7 +666,7 @@ func TestResponsesReasoningHistoryToChat(t *testing.T) {
 func TestResponsesHandlerNonStreamingPreservesFinishAndUsage(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
 	p := testPoolWith(&auth.Auth{UID: "responses", AccessToken: "at", ExpiresAt: time.Now().Add(time.Hour).Unix()})
-	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key"})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key", ResponsesEnabled: true})
 	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hello","store":false}`))
 	r.Header.Set("Authorization", "Bearer key")
 	w := httptest.NewRecorder()
@@ -614,6 +693,81 @@ func TestResponsesHandlerNonStreamingPreservesFinishAndUsage(t *testing.T) {
 	}
 }
 
+// TestResponsesEndpointGate 覆盖原生 Responses 接口开关：缺省关闭时（无论是否
+// 携带鉴权）鉴权前统一 404 endpoint_disabled；经 livecfg 热开启后进入鉴权路径；
+// 关回后恢复 404。上游在任何关闭态都不得被调用。
+func TestResponsesEndpointGate(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		t.Fatal("upstream must not be called while /v1/responses is disabled")
+		return 0, "", false
+	})
+
+	decodeCode := func(t *testing.T, body string) string {
+		t.Helper()
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(body), &payload); err != nil {
+			t.Fatalf("unmarshal error body: %v (%s)", err, body)
+		}
+		errorBody, ok := payload["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("error object missing: %s", body)
+		}
+		code, _ := errorBody["code"].(string)
+		return code
+	}
+
+	// 缺省关闭：无鉴权与带鉴权请求都拿到同一 404（闸门在鉴权之前）。
+	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up, APIKey: "key"})
+	for name, withAuth := range map[string]bool{"without_auth": false, "with_auth": true} {
+		t.Run("disabled_"+name, func(t *testing.T) {
+			r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hello","store":false}`))
+			if withAuth {
+				r.Header.Set("Authorization", "Bearer key")
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("status=%d body=%s want 404", w.Code, w.Body.String())
+			}
+			if code := decodeCode(t, w.Body.String()); code != "endpoint_disabled" {
+				t.Fatalf("error code=%q want endpoint_disabled", code)
+			}
+		})
+	}
+
+	// 热切换：开启后进入鉴权（错 key → 401），正确 key 进入执行层（空池 →
+	// 503 no_healthy_account）；关回后即便带正确 key 也是 404。
+	live := livecfg.New(livecfg.Snapshot{APIKey: "key", ResponsesEnabled: false})
+	hl := NewHandler(Config{Pool: testPoolWith(), Upstream: up, APIKey: "key", Live: live})
+	live.Store(livecfg.Snapshot{APIKey: "key", ResponsesEnabled: true})
+	req := func(withAuth bool) *http.Request {
+		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hello","store":false}`))
+		if withAuth {
+			r.Header.Set("Authorization", "Bearer key")
+		}
+		return r
+	}
+	w := httptest.NewRecorder()
+	hl.ServeHTTP(w, req(false))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("enabled without auth status=%d body=%s want 401", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	hl.ServeHTTP(w, req(true))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("enabled with auth status=%d body=%s want 503", w.Code, w.Body.String())
+	}
+	if code := decodeCode(t, w.Body.String()); code != "no_healthy_account" {
+		t.Fatalf("enabled error code=%q want no_healthy_account", code)
+	}
+	live.Store(livecfg.Snapshot{APIKey: "key", ResponsesEnabled: false})
+	w = httptest.NewRecorder()
+	hl.ServeHTTP(w, req(true))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("re-disabled status=%d body=%s want 404", w.Code, w.Body.String())
+	}
+}
+
 func TestResponsesUnsupportedUpstreamFieldFailsFastWithSafeDiagnostic(t *testing.T) {
 	calls := 0
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
@@ -624,7 +778,7 @@ func TestResponsesUnsupportedUpstreamFieldFailsFastWithSafeDiagnostic(t *testing
 		&auth.Auth{UID: "responses-unsupported-a", AccessToken: "at-a", ExpiresAt: time.Now().Add(time.Hour).Unix()},
 		&auth.Auth{UID: "responses-unsupported-b", AccessToken: "at-b", ExpiresAt: time.Now().Add(time.Hour).Unix()},
 	)
-	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key"})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key", ResponsesEnabled: true})
 	body := `{"model":"glm-5.2","input":"hello","max_output_tokens":64,"reasoning":{"effort":"medium"},"text":{"format":{"type":"text"}},"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}],"tool_choice":"auto"}`
 	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer key")
@@ -671,7 +825,7 @@ func TestResponsesNoHealthyAccountIsNotBlamedOnRequestFields(t *testing.T) {
 		t.Fatal("upstream must not be called with an empty account pool")
 		return 0, "", false
 	})
-	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up, APIKey: "key"})
+	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up, APIKey: "key", ResponsesEnabled: true})
 	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hello","reasoning":{"effort":"medium"}}`))
 	r.Header.Set("Authorization", "Bearer key")
 	w := httptest.NewRecorder()
@@ -706,7 +860,7 @@ func TestResponsesStreamingStateMachine(t *testing.T) {
 	}, "\n\n")
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, stream, true })
 	p := testPoolWith(&auth.Auth{UID: "responses-stream", AccessToken: "at", ExpiresAt: time.Now().Add(time.Hour).Unix()})
-	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key"})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key", ResponsesEnabled: true})
 	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hello","stream":true,"store":false}`))
 	r.Header.Set("Authorization", "Bearer key")
 	w := httptest.NewRecorder()
@@ -752,7 +906,7 @@ func TestResponsesMissingDoneAndTruncatedToolAreNotCompleted(t *testing.T) {
 			stream = strings.ReplaceAll(stream, "\\n", "\n")
 			up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, stream, true })
 			p := testPoolWith(&auth.Auth{UID: "responses-fail-" + name, AccessToken: "at", ExpiresAt: time.Now().Add(time.Hour).Unix()})
-			h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key"})
+			h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key", ResponsesEnabled: true})
 			r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hello","stream":false}`))
 			r.Header.Set("Authorization", "Bearer key")
 			w := httptest.NewRecorder()

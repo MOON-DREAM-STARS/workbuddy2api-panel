@@ -1016,12 +1016,26 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
 // 反证，删了无回滚路径）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	prepared := c.PrepareChatBody(a, body, meta)
+	return c.ChatStreamPreparedContext(ctx, a, prepared, clientIP, meta)
+}
+
+// PrepareChatBody fixes all account/model/config-dependent chat body rewrites
+// once. Callers performing same-account retries can reuse the returned bytes so
+// hot configuration or model-effort cache changes cannot mutate later attempts.
+func (c *Client) PrepareChatBody(a *auth.Auth, body []byte, meta ChatMeta) []byte {
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
+	}
+	return prepared
+}
+
+// ChatStreamPreparedContext sends a body returned by PrepareChatBody without
+// applying any additional body transformations.
+func (c *Client) ChatStreamPreparedContext(ctx context.Context, a *auth.Auth, prepared []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +

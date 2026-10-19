@@ -736,6 +736,7 @@ const cfgForm = { elements: {
   api_key: mk('secret'),
   user_agent: mk(''),
   prompt_file: mk(''),
+  empty_tool_turn_retry_models: mk(''),
   checkin_hours: mk(''),
 }};
 const ctx = {
@@ -746,12 +747,16 @@ const ctx = {
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
 const out = ctx.collectConfig();
+cfgForm.elements.empty_tool_turn_retry_models.value = 'cn:deepseek-v4.1-flash\nglobal:other';
+const filled = ctx.collectConfig();
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
 process.stdout.write(JSON.stringify([
   has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
   has(out.prompt, 'file'), (out.prompt || {}).file,
   has(out, 'listen'),
   has(out.schedule, 'checkin_hours'),
+  JSON.stringify(out.features.empty_tool_turn_retry_models),
+  JSON.stringify(filled.features.empty_tool_turn_retry_models),
   out.api_key
 ]));`
 	f, err := os.CreateTemp(t.TempDir(), "cfgc-*.cjs")
@@ -767,7 +772,7 @@ process.stdout.write(JSON.stringify([
 		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
 	}
 	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发, api_key]
-	const want = `[true,"",true,"",false,false,"secret"]`
+	const want = `[true,"",true,"",false,false,"[]","[\"cn:deepseek-v4.1-flash\",\"global:other\"]","secret"]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
 	}

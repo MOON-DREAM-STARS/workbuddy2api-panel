@@ -15,10 +15,12 @@ import (
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
-	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
-	SanitizeFingerprints bool          // 出站请求体指纹脱敏
-	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	APIKey                   string        // 网关/面板共同鉴权密钥；空 = 不鉴权
+	SoftCooldown             time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
+	SanitizeFingerprints     bool          // 出站请求体指纹脱敏
+	RecordClientInfo         bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	ResponsesEnabled         bool          // 原生 Responses 接口开关（缺省 false = 仅 Chat API）
+	EmptyToolTurnRetryModels []string      // 指定模型的 stop + 空工具回合重试名单；"*" 表示所有模型
 }
 
 // Holder 原子持有当前快照。
@@ -39,10 +41,15 @@ func (h *Holder) Load() Snapshot {
 		return Snapshot{}
 	}
 	if s := h.p.Load(); s != nil {
-		return *s
+		out := *s
+		out.EmptyToolTurnRetryModels = append([]string(nil), s.EmptyToolTurnRetryModels...)
+		return out
 	}
 	return Snapshot{}
 }
 
 // Store 整体替换快照。
-func (h *Holder) Store(s Snapshot) { h.p.Store(&s) }
+func (h *Holder) Store(s Snapshot) {
+	s.EmptyToolTurnRetryModels = append([]string(nil), s.EmptyToolTurnRetryModels...)
+	h.p.Store(&s)
+}

@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -74,6 +75,13 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// ResponsesEnabled 原生 Responses 接口开关（config features.responses_enabled，
+	// 缺省 false = 仅 Chat API）。false 时 POST /v1/responses 在鉴权之前统一返回
+	// 404（code=endpoint_disabled），端点表现为"不存在"；true 时恢复无状态
+	// Responses 子集。Live 快照优先，本字段是 Live=nil 场景（测试/裸用）的静态兜底。
+	ResponsesEnabled         bool
+	EmptyToolTurnRetryModels []string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -82,9 +90,11 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:           h.cfg.APIKey,
-		SoftCooldown:     h.cfg.SoftCooldown,
-		RecordClientInfo: h.cfg.RecordClientInfo,
+		APIKey:                   h.cfg.APIKey,
+		SoftCooldown:             h.cfg.SoftCooldown,
+		RecordClientInfo:         h.cfg.RecordClientInfo,
+		ResponsesEnabled:         h.cfg.ResponsesEnabled,
+		EmptyToolTurnRetryModels: append([]string(nil), h.cfg.EmptyToolTurnRetryModels...),
 	}
 }
 
@@ -136,7 +146,7 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	h.mux.HandleFunc("POST /v1/responses", h.responsesGate(h.withAuth(h.responses)))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -173,6 +183,20 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// responsesGate 原生 Responses 接口运行期闸门：开关关闭（缺省）时在鉴权之前
+// 统一返回 404 JSON，端点表现为"不存在"（网关仅支持 Chat API）；开启时放行至
+// withAuth + h.responses。开关读取 livecfg 快照，面板保存即时生效，无需重启。
+func (h *Handler) responsesGate(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.loadLive().ResponsesEnabled {
+			writeOpenAIError(w, http.StatusNotFound, "endpoint_disabled",
+				"/v1/responses is disabled on this gateway (features.responses_enabled=false); use /v1/chat/completions")
 			return
 		}
 		next(w, r)
@@ -532,6 +556,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 只认前者会让修复层在最需要它的场景下失效。
 	// 在提示词/模型名改写之前取（那些改写不动 tools / messages[].tool_calls 子树）。
 	declaredTools := upstream.ToolNameAllowlist(body)
+	emptyToolRetryEnabled := h.emptyToolTurnRetryEnabled(peek.Model, body)
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -809,9 +834,100 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
-		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		// 仅对显式启用模型的工具请求缓冲响应；语义重试保持同一账号、
+		// 同一份准备后请求体和同一轮 ConversationRequestID。
+		var preparedBody []byte
+		if emptyToolRetryEnabled {
+			preparedBody = h.cfg.Upstream.PrepareChatBody(acct, body, chatMeta)
+		}
+		retryCount := 0
+		var retryUsage map[string]any
+		var bufferedStats *chatStatsReader
+		var finalObservation *upstream.EmptyToolTurnObservation
+		var rc io.ReadCloser
+		var status int
+		var respBody []byte
+		var terr error
+		var attemptStarted time.Time
+		for {
+			// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
+			attemptStarted = time.Now()
+			if emptyToolRetryEnabled {
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamPreparedContext(r.Context(), acct, preparedBody, clientIP, chatMeta)
+			} else {
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+			}
+			if terr != nil || status >= 400 || !emptyToolRetryEnabled {
+				break
+			}
+			bufferedStats = newChatStatsReaderSince(rc, attemptStarted)
+			raw, readErr := readValidatedResponse(bufferedStats)
+			_ = rc.Close()
+			if errors.Is(readErr, errValidatedResponseTooLarge) {
+				if hit, miss, ok := bufferedStats.CacheTokens(); ok {
+					st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
+				}
+				credit, hasCredit := bufferedStats.Credit()
+				recordAttempt(acct.UID, bufferedStats.Usage(), credit, hasCredit, attemptStarted, bufferedStats.TTFB())
+				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
+				releaseHeld()
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_validation_limit", "upstream response exceeded the 8 MiB validation buffer")
+				return
+			}
+			if readErr != nil {
+				if hit, miss, ok := bufferedStats.CacheTokens(); ok {
+					st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
+				}
+				credit, hasCredit := bufferedStats.Credit()
+				recordAttempt(acct.UID, bufferedStats.Usage(), credit, hasCredit, attemptStarted, bufferedStats.TTFB())
+				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeStreamError
+				releaseHeld()
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", "upstream response could not be buffered for validation")
+				return
+			}
+			rc = io.NopCloser(bytes.NewReader(raw))
+			observation, inspectErr := upstream.InspectEmptyToolTurn(raw, body)
+			if inspectErr != nil {
+				break // 让现有 Aggregate/renderer 用原有错误口径处理该流
+			}
+			finalObservation = &observation
+			if !observation.EmptyToolTurnCandidate() {
+				if retryCount > 0 {
+					result := "terminal_" + observation.EmptyToolTurnTerminalReason()
+					if observation.ValidToolCalls > 0 {
+						result = "recovered"
+					}
+					recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname), retryCount+1, result, observation.Response)
+				}
+				break
+			}
+
+			st.cacheHit, st.cacheMiss, st.hasCache = 0, 0, false
+			if usage := usageMap(observation.Response); usage != nil {
+				retryUsage = mergeUsageMaps(retryUsage, usage)
+				if hit, ok := upstream.UsageCacheHitTokens(usage); ok {
+					miss, _ := upstream.UsageCacheMissTokens(usage)
+					st.cacheHit, st.cacheMiss, st.hasCache = int64(hit), int64(miss), true
+				}
+			}
+			credit, total, hasCredit := usageCreditTotal(observation.Response)
+			fillStatFromUsageCompat(st, observation.Response)
+			recordAttempt(acct.UID, usageDeltaFromResponse(observation.Response), credit, hasCredit, attemptStarted, bufferedStats.TTFB())
+			if hasCredit {
+				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			}
+			attemptNumber := retryCount + 1
+			if retryCount >= emptyToolTurnMaxRetries {
+				recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname), attemptNumber, "exhausted", observation.Response)
+				applyUsageToChatStat(st, retryUsage)
+				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
+				releaseHeld()
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_empty_tool_turn", "upstream repeatedly ended a tool-enabled turn without a valid function call")
+				return
+			}
+			recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname), attemptNumber, "retry", observation.Response)
+			retryCount++
+		}
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析）。传输层错误（非 *Error）走抖动换号分支；防御分支
 		// （terr 为 nil 但 status>=400，如 ErrNone 兜底）回落本地 Classify，双保险。
@@ -968,6 +1084,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
+			accountStats := stats
+			var bufferedWriter *bufferedStreamWriter
+			var streamWriter http.ResponseWriter = w
+			if emptyToolRetryEnabled {
+				accountStats = bufferedStats
+				bufferedWriter = newBufferedStreamWriter()
+				streamWriter = bufferedWriter
+			}
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
@@ -978,7 +1102,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 第二个参数为 true = 名单为空时启用弱判定——tools 声明在链路上丢失是
 			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
 			repair := upstream.NewMarkupRepair(declaredTools, true)
-			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
+			sErr := upstream.StreamHint(streamWriter, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
 				upstream.WithMarkupRepair(repair))
@@ -1026,11 +1150,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.cfg.Session.Bind(sessKey, acct.UID)
 				}
 			}
-			credit, hasCredit := stats.Credit()
-			if hit, miss, ok := stats.CacheTokens(); ok {
+			credit, hasCredit := accountStats.Credit()
+			if hit, miss, ok := accountStats.CacheTokens(); ok {
 				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
 			}
-			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted, stats.TTFB())
+			recordAttempt(acct.UID, accountStats.Usage(), credit, hasCredit, attemptStarted, accountStats.TTFB())
 			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
@@ -1046,11 +1170,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, m, len(declaredTools))
 			}
-			st.ttfb = stats.TTFB()
+			st.ttfb = accountStats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
 			// 与非流式走 completionTokens 返回 -1 的口径不一致。
-			if toks, hasUsage := stats.Tokens(); hasUsage {
+			if toks, hasUsage := accountStats.Tokens(); hasUsage {
 				st.toks = toks
 			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
@@ -1058,8 +1182,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if hasCredit {
 				st.credit = credit
 				st.hasCredit = true
-				if total, tok := stats.TotalTokens(); tok && total > 0 {
+				if total, tok := accountStats.TotalTokens(); tok && total > 0 {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+				}
+			}
+			if retryCount > 0 && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame && !upstream.IsEmptyStreamError(sErr) {
+				applyUsageToChatStat(st, mergeUsageMaps(retryUsage, usageMap(finalObservation.Response)))
+			}
+			if bufferedWriter != nil {
+				priorUsage := retryUsage
+				if finalObservation == nil || !finalObservation.SawDone || finalObservation.SawErrorFrame || upstream.IsEmptyStreamError(sErr) {
+					priorUsage = nil
+				}
+				if err := bufferedWriter.CommitTo(w, priorUsage); err != nil {
+					st.outcome = reqlog.OutcomeInterrupted
 				}
 			}
 			rc.Close()
@@ -1096,6 +1232,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+		}
+		if retryCount > 0 && finalObservation != nil && finalObservation.SawDone && !finalObservation.SawErrorFrame {
+			resp["usage"] = mergeUsageMaps(retryUsage, usageMap(resp))
+			applyUsageToChatStat(st, usageMap(resp))
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK

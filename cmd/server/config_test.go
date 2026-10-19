@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,24 @@ func TestDefault(t *testing.T) {
 	}
 	if c.SoftRateDur.Seconds() != 600 {
 		t.Errorf("soft=%v want 600s", c.SoftRateDur)
+	}
+}
+
+func TestEmptyToolTurnRetryModelsDefaultAndNormalize(t *testing.T) {
+	defaults := Default()
+	if err := defaults.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(defaults.Features.EmptyToolTurnRetryModels, []string{"*"}) {
+		t.Fatalf("default retry models=%v want [*]", defaults.Features.EmptyToolTurnRetryModels)
+	}
+	configured, err := ParseConfig([]byte(`{"features":{"empty_tool_turn_retry_models":[" cn:deepseek-v4.1-flash ","cn:deepseek-v4.1-flash","", "global:other", " * "]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"cn:deepseek-v4.1-flash", "global:other", "*"}
+	if !reflect.DeepEqual(configured.Features.EmptyToolTurnRetryModels, want) {
+		t.Fatalf("retry models=%v want %v", configured.Features.EmptyToolTurnRetryModels, want)
 	}
 }
 
