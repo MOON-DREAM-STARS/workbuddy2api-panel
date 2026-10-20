@@ -17,6 +17,9 @@ type EmptyToolTurnObservation struct {
 	SawErrorFrame     bool
 	ValidToolCalls    int
 	RepairedToolCalls int
+	ContentChars      int
+	ReasoningChars    int
+	ReasoningTokens   int64
 	Response          map[string]any
 }
 
@@ -63,7 +66,35 @@ func InspectEmptyToolTurn(raw, requestBody []byte) (EmptyToolTurnObservation, er
 	repair := RepairAggregatedResponse(response, ToolNameAllowlist(requestBody), true)
 	observation.RepairedToolCalls = repair.Converted()
 	observation.ValidToolCalls = countValidFunctionToolCalls(response)
+	observation.ContentChars, observation.ReasoningChars = EmptyToolTurnTextStats(response)
+	observation.ReasoningTokens = emptyToolTurnReasoningTokens(response)
 	return observation, nil
+}
+
+// EmptyToolTurnTextStats returns only the amount of visible assistant content
+// and reasoning text. It never returns the text itself.
+func EmptyToolTurnTextStats(response map[string]any) (contentChars, reasoningChars int) {
+	choices, _ := response["choices"].([]any)
+	for _, rawChoice := range choices {
+		choice, _ := rawChoice.(map[string]any)
+		message, _ := choice["message"].(map[string]any)
+		if content, _ := message["content"].(string); strings.TrimSpace(content) != "" {
+			contentChars += len(strings.TrimSpace(content))
+		}
+		if reasoning, _ := message["reasoning_content"].(string); strings.TrimSpace(reasoning) != "" {
+			reasoningChars += len(strings.TrimSpace(reasoning))
+		}
+	}
+	return contentChars, reasoningChars
+}
+
+func emptyToolTurnReasoningTokens(response map[string]any) int64 {
+	usage, _ := response["usage"].(map[string]any)
+	details, _ := usage["completion_tokens_details"].(map[string]any)
+	if value, ok := usageNumber(details, "reasoning_tokens"); ok && value > 0 {
+		return int64(value)
+	}
+	return 0
 }
 
 func countValidFunctionToolCalls(response map[string]any) int {
@@ -106,6 +137,13 @@ func (o EmptyToolTurnObservation) EmptyToolTurnCandidate() bool {
 	if !o.SawDone || !o.SawFinishReason || o.FinishReason != "stop" || o.SawErrorFrame || o.ValidToolCalls != 0 {
 		return false
 	}
+	// A normal final text answer can legitimately have finish_reason=stop even
+	// when the request declared tools. Retrying it can discard a valid answer
+	// and amplify a client tool loop, so only a truly empty assistant turn is
+	// eligible.
+	if o.ContentChars != 0 || o.ReasoningChars != 0 || o.ReasoningTokens != 0 {
+		return false
+	}
 	if o.Response == nil {
 		return false
 	}
@@ -132,6 +170,12 @@ func (o EmptyToolTurnObservation) EmptyToolTurnTerminalReason() string {
 	}
 	if o.ValidToolCalls != 0 {
 		return "valid_tool_calls"
+	}
+	if o.ContentChars != 0 {
+		return "content_present"
+	}
+	if o.ReasoningChars != 0 || o.ReasoningTokens != 0 {
+		return "reasoning_present"
 	}
 	return "empty_tool_turn"
 }

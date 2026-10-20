@@ -69,6 +69,14 @@ type ChatRenderer interface {
 	RenderNonStream(context.Context, io.ReadCloser, ChatRenderMeta) ChatOutcome
 }
 
+// chatStreamLifecycle is implemented by renderers that can safely commit a
+// content-free stream preface and later terminate it with a stream error.
+// executeChat calls it only for an identified empty-tool-turn candidate.
+type chatStreamLifecycle interface {
+	BeginStream(model string) error
+	FailStream(code, message, hint string) error
+}
+
 type chatFailure struct {
 	Status  int
 	Code    string
@@ -99,6 +107,11 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 
 	realm, bareModel := resolveModel(req.Model)
 	emptyToolRetryEnabled := h.emptyToolTurnRetryEnabled(req.Model, req.Body)
+	var streamLifecycle chatStreamLifecycle
+	if lifecycle, ok := renderer.(chatStreamLifecycle); ok {
+		streamLifecycle = lifecycle
+	}
+	streamStarted := false
 	st := newChatStat(time.Now(), req.Body, req.Stream)
 	if trace := requestTraceFromContext(ctx); trace != nil {
 		trace.stat = st
@@ -255,6 +268,12 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 				recordResponsesUsage(h, st, acct.UID, bareModel, pool.TokenUsageDelta{}, 0, false, attemptStarted)
 				recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname),
 					emptyRetryState.retries+1, "deadline", nil, time.Since(attemptStarted), 0)
+				if streamStarted && streamLifecycle != nil {
+					releaseHeld()
+					_ = streamLifecycle.FailStream("upstream_empty_tool_turn", "empty tool-turn retry budget expired", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return ChatOutcome{Status: http.StatusOK, OutputCommitted: true}, nil
+				}
 				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
 				releaseHeld()
 				return ChatOutcome{Status: http.StatusGatewayTimeout}, &chatFailure{
@@ -275,6 +294,12 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 				recordResponsesUsage(h, st, acct.UID, bareModel, bufferedStats.Usage(), credit, hasCredit, attemptStarted)
 				recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname),
 					emptyRetryState.retries+1, "deadline", nil, time.Since(attemptStarted), bufferedStats.TTFB())
+				if streamStarted && streamLifecycle != nil {
+					releaseHeld()
+					_ = streamLifecycle.FailStream("upstream_empty_tool_turn", "empty tool-turn retry budget expired", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return ChatOutcome{Status: http.StatusOK, OutputCommitted: true}, nil
+				}
 				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
 				releaseHeld()
 				return ChatOutcome{Status: http.StatusGatewayTimeout}, &chatFailure{
@@ -286,6 +311,12 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 				credit, hasCredit := bufferedStats.Credit()
 				delta := bufferedStats.Usage()
 				recordResponsesUsage(h, st, acct.UID, bareModel, delta, credit, hasCredit, attemptStarted)
+				if streamStarted && streamLifecycle != nil {
+					releaseHeld()
+					_ = streamLifecycle.FailStream("upstream_validation_limit", "upstream response exceeded the 8 MiB validation buffer", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return ChatOutcome{Status: http.StatusOK, OutputCommitted: true}, nil
+				}
 				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
 				releaseHeld()
 				return ChatOutcome{Status: http.StatusBadGateway}, &chatFailure{
@@ -297,6 +328,12 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 				credit, hasCredit := bufferedStats.Credit()
 				delta := bufferedStats.Usage()
 				recordResponsesUsage(h, st, acct.UID, bareModel, delta, credit, hasCredit, attemptStarted)
+				if streamStarted && streamLifecycle != nil {
+					releaseHeld()
+					_ = streamLifecycle.FailStream("upstream_parse", "upstream response could not be buffered for validation", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return ChatOutcome{Status: http.StatusOK, OutputCommitted: true}, nil
+				}
 				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeStreamError
 				releaseHeld()
 				return ChatOutcome{Status: http.StatusBadGateway}, &chatFailure{
@@ -342,8 +379,24 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 			attemptNumber := emptyRetryState.retries + 1
 			recordEmptyToolTurnAttempt(ctx, bareModel, logfmt.Label(acct.UID, acct.Nickname),
 				attemptNumber, outcome, observation.Response, time.Since(attemptStarted), bufferedStats.TTFB())
+			if req.Stream && !streamStarted && streamLifecycle != nil {
+				if err := streamLifecycle.BeginStream(bareModel); err != nil {
+					unbindSticky()
+					releaseHeld()
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeInterrupted
+					return ChatOutcome{Status: http.StatusOK, OutputCommitted: true}, nil
+				}
+				streamStarted = true
+			}
 			if !canRetry {
 				applyUsageToChatStat(st, emptyRetryState.usage)
+				if streamStarted && streamLifecycle != nil {
+					unbindSticky()
+					releaseHeld()
+					_ = streamLifecycle.FailStream("upstream_empty_tool_turn", "upstream repeatedly ended a tool-enabled turn without a valid function call", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return ChatOutcome{Status: http.StatusOK, OutputCommitted: true}, nil
+				}
 				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
 				unbindSticky()
 				releaseHeld()
@@ -549,12 +602,31 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 		}
 	}
 	st.status = status
+	if streamStarted && streamLifecycle != nil {
+		_ = streamLifecycle.FailStream(code, msg, hint)
+		st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+		return ChatOutcome{Status: http.StatusOK, OutputCommitted: true}, nil
+	}
 	return ChatOutcome{Status: status}, &chatFailure{Status: status, Code: code, Message: msg, Hint: hint}
 }
 
 type legacyChatRenderer struct {
 	h *Handler
 	w http.ResponseWriter
+}
+
+func (r *legacyChatRenderer) BeginStream(model string) error {
+	if r == nil {
+		return errors.New("nil chat renderer")
+	}
+	return writeChatStreamPreamble(r.w, model)
+}
+
+func (r *legacyChatRenderer) FailStream(code, message, hint string) error {
+	if r == nil {
+		return errors.New("nil chat renderer")
+	}
+	return writeChatStreamError(r.w, code, message, hint)
 }
 
 func (r *legacyChatRenderer) RenderStream(_ context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {

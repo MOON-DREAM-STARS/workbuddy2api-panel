@@ -561,6 +561,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 在提示词/模型名改写之前取（那些改写不动 tools / messages[].tool_calls 子树）。
 	declaredTools := upstream.ToolNameAllowlist(body)
 	emptyToolRetryEnabled := h.emptyToolTurnRetryEnabled(peek.Model, body)
+	streamStarted := false
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -874,6 +875,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname),
 					emptyRetryState.retries+1, "deadline", nil, time.Since(attemptStarted), 0)
+				if streamStarted {
+					releaseHeld()
+					_ = writeChatStreamError(w, "upstream_empty_tool_turn", "empty tool-turn retry budget expired", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
 				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
 				releaseHeld()
 				writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_empty_tool_turn", "empty tool-turn retry budget expired")
@@ -895,6 +902,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				recordAttempt(acct.UID, bufferedStats.Usage(), credit, hasCredit, attemptStarted, bufferedStats.TTFB())
 				recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname),
 					emptyRetryState.retries+1, "deadline", nil, time.Since(attemptStarted), bufferedStats.TTFB())
+				if streamStarted {
+					releaseHeld()
+					_ = writeChatStreamError(w, "upstream_empty_tool_turn", "empty tool-turn retry budget expired", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
 				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
 				releaseHeld()
 				writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_empty_tool_turn", "empty tool-turn retry budget expired")
@@ -906,6 +919,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				credit, hasCredit := bufferedStats.Credit()
 				recordAttempt(acct.UID, bufferedStats.Usage(), credit, hasCredit, attemptStarted, bufferedStats.TTFB())
+				if streamStarted {
+					releaseHeld()
+					_ = writeChatStreamError(w, "upstream_validation_limit", "upstream response exceeded the 8 MiB validation buffer", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
 				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
 				releaseHeld()
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_validation_limit", "upstream response exceeded the 8 MiB validation buffer")
@@ -917,6 +936,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				credit, hasCredit := bufferedStats.Credit()
 				recordAttempt(acct.UID, bufferedStats.Usage(), credit, hasCredit, attemptStarted, bufferedStats.TTFB())
+				if streamStarted {
+					releaseHeld()
+					_ = writeChatStreamError(w, "upstream_parse", "upstream response could not be buffered for validation", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
 				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeStreamError
 				releaseHeld()
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", "upstream response could not be buffered for validation")
@@ -959,8 +984,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			attemptNumber := emptyRetryState.retries + 1
 			recordEmptyToolTurnAttempt(r.Context(), bareModel, logfmt.Label(acct.UID, acct.Nickname),
 				attemptNumber, outcome, observation.Response, time.Since(attemptStarted), bufferedStats.TTFB())
+			if peek.Stream && !streamStarted {
+				if err := writeChatStreamPreamble(w, bareModel); err != nil {
+					unbindSticky()
+					releaseHeld()
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeInterrupted
+					return
+				}
+				streamStarted = true
+			}
 			if !canRetry {
 				applyUsageToChatStat(st, emptyRetryState.usage)
+				if streamStarted {
+					unbindSticky()
+					releaseHeld()
+					_ = writeChatStreamError(w, "upstream_empty_tool_turn", "upstream repeatedly ended a tool-enabled turn without a valid function call", "")
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
 				st.status, st.outcome = http.StatusGatewayTimeout, reqlog.OutcomeHTTPError
 				unbindSticky()
 				releaseHeld()
@@ -1053,8 +1094,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
 					msg = "content blocked by upstream content firewall"
 				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg,
-					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
+				hint := h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr)
+				if streamStarted {
+					_ = writeChatStreamError(w, "content_blocked", msg, hint)
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg, hint)
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
 				return
@@ -1068,8 +1114,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
-					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
+				msg := promptTooLongMessage(string(respBody))
+				hint := h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr)
+				if streamStarted {
+					_ = writeChatStreamError(w, "prompt_too_long", msg, hint)
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", msg, hint)
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
 				return
@@ -1083,8 +1135,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if strings.TrimSpace(msg) == "" {
 					msg = "image request was rejected by upstream"
 				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "image_invalid", msg,
-					h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr))
+				hint := h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr)
+				if streamStarted {
+					_ = writeChatStreamError(w, "image_invalid", msg, hint)
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "image_invalid", msg, hint)
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
 				return
@@ -1101,8 +1158,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if strings.TrimSpace(msg) == "" {
 					msg = "chat request body was rejected by upstream"
 				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg,
-					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
+				hint := h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr)
+				if streamStarted {
+					_ = writeChatStreamError(w, "bad_params", msg, hint)
+					st.status, st.outcome = http.StatusOK, reqlog.OutcomeStreamError
+					return
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg, hint)
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
 				return
@@ -1377,6 +1439,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			hint += "; upstream: " + s
 		}
 		status = http.StatusBadRequest
+	}
+	if streamStarted {
+		_ = writeChatStreamError(w, code, msg, hint)
+		st.status = http.StatusOK
+		st.outcome = reqlog.OutcomeStreamError
+		return
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status

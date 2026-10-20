@@ -356,18 +356,20 @@ type requestTrace struct {
 func recordEmptyToolTurnAttempt(ctx context.Context, model, account string, attempt int, outcome string, response map[string]any, duration, ttfb time.Duration) {
 	usage := usageMap(response)
 	prompt, completion, total, hit, miss, reasoning, credit, hasUsage, hasCredit := attemptUsageDetails(usage)
+	contentChars, reasoningChars := upstream.EmptyToolTurnTextStats(response)
 	summary := reqlog.EmptyToolTurnAttempt{
 		Attempt: attempt, Outcome: outcome, Account: account,
 		DurationMs: duration.Milliseconds(), TTFBMs: ttfb.Milliseconds(),
 		PromptTokens: prompt, CompletionTokens: completion, TotalTokens: total,
 		CacheHitTokens: hit, CacheMissTokens: miss, ReasoningTokens: reasoning,
+		ContentChars: contentChars, ReasoningChars: reasoningChars,
 		Credit: credit, HasCredit: hasCredit, HasUsage: hasUsage,
 	}
 	if trace := requestTraceFromContext(ctx); trace != nil {
 		trace.emptyToolTurnAttempts = append(trace.emptyToolTurnAttempts, summary)
 	}
-	log.Printf("INFO: [server] empty_tool_turn acct=%s model=%s attempt=%d outcome=%s duration_ms=%d ttfb_ms=%d usage=%t prompt=%d completion=%d total=%d cache_hit=%d cache_miss=%d reasoning=%d credit_known=%t credit=%.6f",
-		account, model, attempt, outcome, duration.Milliseconds(), ttfb.Milliseconds(), hasUsage, prompt, completion, total, hit, miss, reasoning, hasCredit, credit)
+	log.Printf("INFO: [server] empty_tool_turn acct=%s model=%s attempt=%d outcome=%s duration_ms=%d ttfb_ms=%d usage=%t prompt=%d completion=%d total=%d cache_hit=%d cache_miss=%d reasoning=%d content_chars=%d reasoning_chars=%d credit_known=%t credit=%.6f",
+		account, model, attempt, outcome, duration.Milliseconds(), ttfb.Milliseconds(), hasUsage, prompt, completion, total, hit, miss, reasoning, contentChars, reasoningChars, hasCredit, credit)
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：

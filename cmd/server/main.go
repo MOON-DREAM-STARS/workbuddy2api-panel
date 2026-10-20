@@ -233,7 +233,7 @@ func main() {
 	} else {
 		log.Printf("原生 Responses 接口关闭（缺省，features.responses_enabled=false）：仅提供 /v1/chat/completions；面板可热开启")
 	}
-	log.Printf("空工具回合保护：models=%v max_retries=%d budget=%s（换号重试，耗尽返回 504）",
+	log.Printf("空工具回合保护：models=%v max_retries=%d budget=%s（仅真正空白回合换号；流式耗尽发送终止事件）",
 		cfg.Features.EmptyToolTurnRetryModels, cfg.Features.EmptyToolTurnMaxRetries, cfg.EmptyToolTurnRetryBudgetDur)
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进

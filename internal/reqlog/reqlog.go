@@ -102,6 +102,8 @@ type EmptyToolTurnAttempt struct {
 	CacheHitTokens   int64   `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens  int64   `json:"cache_miss_tokens,omitempty"`
 	ReasoningTokens  int64   `json:"reasoning_tokens,omitempty"`
+	ContentChars     int     `json:"content_chars,omitempty"`
+	ReasoningChars   int     `json:"reasoning_chars,omitempty"`
 	Credit           float64 `json:"credit,omitempty"`
 	HasCredit        bool    `json:"credit_known"`
 	HasUsage         bool    `json:"usage_known"`

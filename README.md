@@ -381,7 +381,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
-| `features.empty_tool_turn_retry_models` | `["*"]` | 启用空工具回合换号保护的模型名单；`*` = 所有模型，空数组 = 关闭 |
+| `features.empty_tool_turn_retry_models` | `["*"]` | 启用真正空白工具回合换号保护的模型名单；`*` = 所有模型，空数组 = 关闭 |
 | `features.empty_tool_turn_max_retries` | `1` | 空工具回合最多换号次数（0–2）；0 = 只检测不换号 |
 | `features.empty_tool_turn_retry_budget` | `75s` | 空工具回合从请求开始计算的总预算（15s–180s）；第二次尝试不得超过截止时间 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
@@ -710,9 +710,9 @@ http://127.0.0.1:7863/panel/
 
 ### `stop` 空工具回合保护（Issue #149）
 
-`features.empty_tool_turn_retry_models` 缺省为 `["*"]`，即对所有模型启用；也可以配置模型名单，空名单可显式关闭。只有请求声明了函数工具、`tool_choice` 缺省或为 `auto` 时才检查。若上游原始 SSE 明确带有 `[DONE]` 和 `finish_reason:"stop"`，没有 error frame，且经过现有 DSML 标记修复后仍没有合法 `tool_calls`，网关会在向客户端提交任何输出前换一个健康账号重试；每次重试沿用同一逻辑请求和 `X-Conversation-Request-ID`，但按账号重新计算 `prompt_cache_key`。`features.empty_tool_turn_max_retries` 缺省为 `1`，即原始请求后最多换一个账号；`features.empty_tool_turn_retry_budget` 缺省为 `75s`，从请求开始计算，第二次尝试不得超过该截止时间。reasoning-only、短正文和长正文都按相同规则检查；不会把历史思考注入 `<thought>`。
+`features.empty_tool_turn_retry_models` 缺省为 `["*"]`，即对所有模型启用；也可以配置模型名单，空名单可显式关闭。只有请求声明了函数工具、`tool_choice` 缺省或为 `auto` 时才检查。若上游原始 SSE 明确带有 `[DONE]` 和 `finish_reason:"stop"`，没有 error frame，经过现有 DSML 标记修复后仍没有合法 `tool_calls`，并且聚合后的正文为空或仅空白、没有 reasoning 内容和 reasoning token，网关才会换一个健康账号重试。非空正文、短正文、长正文、reasoning-only 和合法工具调用均视为正常最终输出并原样返回，避免误丢最终答案和放大客户端的工具循环。每次重试沿用同一逻辑请求和 `X-Conversation-Request-ID`，但按账号重新计算 `prompt_cache_key`。`features.empty_tool_turn_max_retries` 缺省为 `1`，即原始请求后最多换一个账号；`features.empty_tool_turn_retry_budget` 缺省为 `75s`，从请求开始计算，第二次尝试不得超过该截止时间。不会把历史思考注入 `<thought>`。
 
-这类请求的候选 SSE 会先缓冲以确保失败尝试不泄漏给 Chat 或 Responses 客户端；单次上游响应上限为 8 MiB，超限 fail-closed 返回 `502 upstream_validation_limit`。换号耗尽、没有其他健康账号或预算不足时返回 `504 upstream_empty_tool_turn`，不返回前几次的部分文本，也不对账号施加冷却/熔断惩罚。选择 504 是为了让 NewAPI 当前“504 永不重试”的规则停止同一渠道重复放大；后续启用低优先级降级渠道时再改为 502。恢复后对外 usage 汇总每次尝试的输入、输出、缓存、reasoning 和 credit，并重算 total；请求归档及服务日志记录每次尝试的账号脱敏标签、耗时、TTFB、结果和用量。面板「配置 → 服务」中的模型名单、换号次数和预算均可热更新。
+真正空白的候选 SSE 会先缓冲以确保失败尝试不泄漏给 Chat 或 Responses 客户端；单次上游响应上限为 8 MiB，超限 fail-closed 返回 `502 upstream_validation_limit`。发现真空回合后，如果是流式请求，网关会先提交不含正文的 SSE 前导帧，使 Responses 客户端收到 `response.created` / `response.in_progress`；换号耗尽、没有其他健康账号或预算不足时，再用 `upstream_empty_tool_turn` 的 Chat error frame 或 Responses `response.failed` 结束已经建立的流，HTTP 状态保持 200，不再返回会把 Codex 打成“重新连接”的 504。非流式请求仍保留原有 HTTP 错误语义。恢复后对外 usage 汇总每次尝试的输入、输出、缓存、reasoning 和 credit，并重算 total；请求归档及服务日志记录每次尝试的账号脱敏标签、耗时、TTFB、`content_chars`、`reasoning_chars`、结果和用量。面板「配置 → 服务」中的模型名单、换号次数和预算均可热更新。
 
 Codex 的上下文压缩请求（最后一条 user 消息以 `You are performing a CONTEXT CHECKPOINT COMPACTION.` 开头）即使命中模型名单也不会进入上述重试；压缩摘要是普通 `stop` 响应，不能按空工具回合处理。
 

@@ -1537,10 +1537,39 @@ func decodeChatSSE(r io.Reader, onChunk func(map[string]any) error) chatSSEDecod
 type responsesRenderer struct {
 	req     responsesRequest
 	encoder *responseSSEEncoder
+	state   *responseState
+}
+
+func (r *responsesRenderer) BeginStream(string) error {
+	if r == nil || r.encoder == nil {
+		return nil
+	}
+	if r.state == nil {
+		r.state = newResponseState(r.req, true, r.encoder)
+	}
+	r.state.start()
+	return r.encoder.err
+}
+
+func (r *responsesRenderer) FailStream(code, message, _ string) error {
+	if r == nil || r.encoder == nil {
+		return nil
+	}
+	if r.state == nil {
+		r.state = newResponseState(r.req, true, r.encoder)
+	}
+	r.state.upstreamErr = map[string]any{
+		"code":    code,
+		"message": message,
+		"type":    "server_error",
+	}
+	r.state.finish(false, nil)
+	return r.encoder.err
 }
 
 func (r *responsesRenderer) RenderStream(_ context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {
-	state, stats, decoded := decodeResponsesUpstream(r.req, rc, meta.Started, r.encoder)
+	state, stats, decoded := decodeResponsesUpstream(r.req, rc, meta.Started, r.encoder, r.state)
+	r.state = state
 	state.priorUsage = meta.PriorUsage
 	state.finish(decoded.SawDone, decoded.Err)
 	out := state.outcome()
@@ -1552,7 +1581,7 @@ func (r *responsesRenderer) RenderStream(_ context.Context, rc io.ReadCloser, me
 }
 
 func (r *responsesRenderer) RenderNonStream(_ context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {
-	state, _, decoded := decodeResponsesUpstream(r.req, rc, time.Time{}, nil)
+	state, _, decoded := decodeResponsesUpstream(r.req, rc, time.Time{}, nil, nil)
 	state.priorUsage = meta.PriorUsage
 	state.finish(decoded.SawDone, decoded.Err)
 	out := state.outcome()
@@ -1600,14 +1629,16 @@ func (w *responsePipeWriter) Write(p []byte) (int, error) {
 }
 func (w *responsePipeWriter) Flush() {}
 
-func decodeResponsesUpstream(req responsesRequest, rc io.Reader, started time.Time, encoder *responseSSEEncoder) (*responseState, *chatStatsReader, chatSSEDecodeResult) {
+func decodeResponsesUpstream(req responsesRequest, rc io.Reader, started time.Time, encoder *responseSSEEncoder, state *responseState) (*responseState, *chatStatsReader, chatSSEDecodeResult) {
 	tracked := &responseDoneReader{r: rc}
 	statsStart := started
 	if statsStart.IsZero() {
 		statsStart = time.Now()
 	}
 	stats := newChatStatsReaderSince(tracked, statsStart)
-	state := newResponseState(req, encoder != nil, encoder)
+	if state == nil {
+		state = newResponseState(req, encoder != nil, encoder)
+	}
 	state.start()
 	reader, writer := io.Pipe()
 	go func() {

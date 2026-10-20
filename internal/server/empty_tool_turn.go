@@ -338,6 +338,78 @@ func lineEnding(part string) string {
 	return ""
 }
 
+// writeChatStreamPreamble commits a protocol-valid, content-free Chat SSE
+// preface. It is used only after a real empty tool turn has been identified,
+// immediately before an account retry or terminal stream failure. The preamble
+// makes the downstream Responses converter emit response.created while the
+// rejected attempts remain fully buffered and cannot leak their text.
+func writeChatStreamPreamble(w http.ResponseWriter, model string) error {
+	if w == nil {
+		return errors.New("nil stream writer")
+	}
+	header := w.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("Connection", "keep-alive")
+	header.Set("X-Accel-Buffering", "no")
+	frame := map[string]any{
+		"id":      "chatcmpl-wb2api-preface",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{"role": "assistant"},
+			"finish_reason": nil,
+		}},
+	}
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
+		return err
+	}
+	flushResponseWriter(w)
+	return nil
+}
+
+// writeChatStreamError terminates an already-committed Chat SSE response.
+// NewAPI recognizes the top-level error object and converts it to a Responses
+// response.failed event; direct Chat clients also receive an unambiguous error
+// followed by [DONE].
+func writeChatStreamError(w http.ResponseWriter, code, message, hint string) error {
+	if w == nil {
+		return errors.New("nil stream writer")
+	}
+	errorBody := map[string]any{
+		"message": message,
+		"type":    "api_error",
+		"code":    code,
+	}
+	if hint != "" {
+		errorBody["gateway_hint"] = hint
+	}
+	raw, err := json.Marshal(map[string]any{"error": errorBody})
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	flushResponseWriter(w)
+	return nil
+}
+
+func flushResponseWriter(w http.ResponseWriter) {
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 type bufferedStreamWriter struct {
 	header http.Header
 	status int
