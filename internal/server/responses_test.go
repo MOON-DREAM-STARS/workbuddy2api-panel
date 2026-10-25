@@ -1056,3 +1056,18 @@ func TestResponsesLateToolIDDoesNotRewritePublicID(t *testing.T) {
 		t.Fatalf("public call_id changed from %v to %v", publicID, state.items[0]["call_id"])
 	}
 }
+
+func TestResponsesHiddenModelRejectedWithoutUpstreamCall(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		t.Error("hidden model must not reach upstream")
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "hidden", AccessToken: "at", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	h := NewHandler(Config{Pool: p, Upstream: up, ResponsesEnabled: true, ModelsHidden: []string{"glm-5.2"}})
+	request := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hello"}`))
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "model_unavailable") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
