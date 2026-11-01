@@ -70,7 +70,7 @@ compact 请求支持 `model`、`input`、`instructions`，以及现有 Responses
 ]
 ```
 
-这是 `advanced_custom.routes` 的条目示意，Base URL 应指向已启用功能的 WorkBuddy；不要直接覆盖整个渠道配置。不能继续使用 `openai_responses_to_openai_chat_completions`：转换成 Chat 后，压缩项无法回到 WorkBuddy 的 Responses 解码路径。模型映射和负载均衡必须让后续请求回到具有相同密钥的网关，不能切换到 OpenAI 或其它供应商。上线前分别验证直连及 New API 的 compact → Responses → compact 流程。
+这是 `advanced_custom.advanced_routes` 的条目示意，Base URL 应指向已启用功能的 WorkBuddy；不要直接覆盖整个渠道配置。不能继续使用 `openai_responses_to_openai_chat_completions`：转换成 Chat 后，压缩项无法回到 WorkBuddy 的 Responses 解码路径。模型映射和负载均衡必须让后续请求回到具有相同密钥的网关，不能切换到 OpenAI 或其它供应商。上线前分别验证直连及 New API 的 compact → Responses → compact 流程。
 
 ## 限制与失败处理
 
