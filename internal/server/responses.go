@@ -19,18 +19,19 @@ import (
 )
 
 type responsesRequest struct {
-	Input            any // validated, expanded history; preserves public tool identities
-	Raw              map[string]any
-	Model            string
-	Stream           bool
-	Metadata         map[string]any
-	PromptCacheKey   string
-	Tools            []any
-	ToolChoice       any
-	ParallelTools    bool
-	ReasoningEffort  string
-	ReasoningSummary string
-	TextFormat       map[string]any
+	CompactionTrigger bool
+	Input             any // validated, expanded history; preserves public tool identities
+	Raw               map[string]any
+	Model             string
+	Stream            bool
+	Metadata          map[string]any
+	PromptCacheKey    string
+	Tools             []any
+	ToolChoice        any
+	ParallelTools     bool
+	ReasoningEffort   string
+	ReasoningSummary  string
+	TextFormat        map[string]any
 	// ClientMetadata is a Codex compatibility field. It is intentionally kept
 	// out of ChatBody because the WorkBuddy Chat upstream has no contract for it.
 	ClientMetadata any
@@ -122,11 +123,15 @@ func parseResponsesRequestWithCompaction(raw []byte, codec *CompactionCodec) (re
 		return responsesRequest{}, responseBad("input", "input is required")
 	}
 
-	input, err := expandCompactionInput(input, codec)
+	input, compact, err := stripCompactionTrigger(input)
 	if err != nil {
 		return responsesRequest{}, err
 	}
-	out := responsesRequest{Input: input, Raw: req, Model: model, ParallelTools: true, ToolNames: newResponseToolNames()}
+	input, err = expandCompactionInput(input, codec)
+	if err != nil {
+		return responsesRequest{}, err
+	}
+	out := responsesRequest{CompactionTrigger: compact, Input: input, Raw: req, Model: model, ParallelTools: true, ToolNames: newResponseToolNames()}
 	if v, exists := req["client_metadata"]; exists {
 		// This is request metadata for Codex clients, not a WorkBuddy Chat
 		// control. Accept it explicitly but never copy it into ChatBody.
@@ -554,7 +559,7 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 	allowed := map[string]bool{}
 	switch typ {
 	case "message":
-		allowed = map[string]bool{"type": true, "role": true, "content": true, "phase": true, "id": true, "status": true}
+		allowed = map[string]bool{"type": true, "role": true, "content": true, "phase": true, "id": true, "status": true, "internal_chat_message_metadata_passthrough": true}
 	case "input_text":
 		allowed = map[string]bool{"type": true, "text": true}
 	case "input_image":
@@ -589,6 +594,11 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 		if !ok || (role != "user" && role != "assistant" && role != "system" && role != "developer") {
 			return responseBad(fmt.Sprintf("input[%d].role", pos), "unsupported message role")
 		}
+		if metadata := item["internal_chat_message_metadata_passthrough"]; metadata != nil {
+			if _, ok := metadata.(map[string]any); !ok {
+				return responseBad(fmt.Sprintf("input[%d].internal_chat_message_metadata_passthrough", pos), "must be an object or null")
+			}
+		}
 		if status, exists := item["status"]; exists && status != nil {
 			if role != "assistant" || (status != "completed" && status != "in_progress" && status != "incomplete") {
 				return responseBad(fmt.Sprintf("input[%d].status", pos), "unsupported assistant message status")
@@ -606,6 +616,7 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 				return responseUnsupported(fmt.Sprintf("input[%d].phase", pos), "only commentary or final_answer is supported")
 			}
 		}
+		// Client-only Codex message metadata is accepted but never copied to Chat.
 		content, err := responsesContent(item["content"])
 		if err != nil {
 			return responseBad(fmt.Sprintf("input[%d].content", pos), err.Error())
@@ -1688,6 +1699,10 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	req, err := parseResponsesRequestWithCompaction(raw, h.cfg.Compaction)
 	if err != nil {
 		writeResponsesValidationError(w, err)
+		return
+	}
+	if req.CompactionTrigger {
+		h.compactionGate(func(w http.ResponseWriter, r *http.Request) { h.runCompaction(w, r, req, true) })(w, r)
 		return
 	}
 	encoder := &responseSSEEncoder{}

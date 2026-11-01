@@ -59,6 +59,12 @@ Content-Type: application/json
 
 compact 请求支持 `model`、`input`、`instructions`，以及现有 Responses 子集支持的 `tools`、`parallel_tool_calls`、`reasoning`、`service_tier`、`prompt_cache_key`、`text`。工具定义仅用于历史校验和名称映射，摘要请求不带工具；本文接口不会运行工具。`instructions` 作为本次摘要的历史上下文，不被永久保存为系统指令，后续调用应重新携带所需 instructions。不支持 `stream`、客户端指定输出上限、非空 `previous_response_id`、conversation、store 或自动 `context_management`。未知字段明确返回 400。
 
+## Codex remote compaction v2
+
+同时支持当前 Codex 客户端在 `/v1/responses` 的 input 末尾发送单个 `{ "type": "compaction_trigger" }`。这会进入同一有界摘要和加密执行链；非流式返回普通 `response` 对象，流式发送 `response.*` SSE，在 completed 响应中携带完整保留窗口和恰好一个 compaction item。不会把 trigger 当作普通历史文本传入 Chat，也不要求切换客户端的实验性功能开关。
+
+触发项必须是最后一项且只含 type；重复/中间出现/带未知字段的 trigger 返回 400。此路径同样要求持久化密钥与 Responses 开关；失败保留原历史。这是显式触发兼容，不提供自动 context_management 阈值压缩。
+
 ## New API AdvancedCustom 路由
 
 本 fork 的 New API 已支持 compact（核对版本 `9b3c597`），无需为本功能修改源码。需要为对应 WorkBuddy 渠道一起配置两条**直接透传**路由，保留原有其它路由、模型匹配和认证配置：

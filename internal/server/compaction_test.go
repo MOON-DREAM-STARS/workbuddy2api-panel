@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -306,4 +307,92 @@ func TestCompactionCancellationAndDeadline(t *testing.T) {
 		t.Fatal("cancelled request leaked its account lease")
 	}
 	p.Release("compact")
+}
+
+func TestCompactionTriggerResponsesRoundTrip(t *testing.T) {
+	codec, _ := testCompactionCodec(t)
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint(stream), func(t *testing.T) {
+			calls := 0
+			up := newFakeUpstream(t, func(string) (int, string, bool) { calls++; return 200, sseOK, true })
+			transport := up.HTTP.Transport
+			up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				raw, _ := io.ReadAll(r.Body)
+				if bytes.Contains(raw, []byte("internal_chat_message_metadata_passthrough")) {
+					t.Fatal("client metadata leaked into Chat")
+				}
+				r.Body = io.NopCloser(bytes.NewReader(raw))
+				return transport.RoundTrip(r)
+			})
+			p := testPoolWith(&auth.Auth{UID: "v2", AccessToken: "at", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+			defer p.Close()
+			h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "key", ResponsesEnabled: true, Compaction: codec})
+			input := []any{map[string]any{"role": "user", "internal_chat_message_metadata_passthrough": map[string]any{"synthetic": true}, "content": []any{map[string]any{"type": "input_text", "text": "remember project"}}}, map[string]any{"role": "assistant", "content": "work completed"}, map[string]any{"type": "compaction_trigger"}}
+			for cycle := 0; cycle < 2; cycle++ {
+				body, _ := json.Marshal(map[string]any{"model": "glm-5.2", "input": input, "stream": stream, "store": false, "include": []string{"reasoning.encrypted_content"}, "client_metadata": map[string]any{}, "tools": []any{}, "tool_choice": "auto"})
+				r := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(body))
+				r.Header.Set("Authorization", "Bearer key")
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, r)
+				if w.Code != 200 {
+					t.Fatalf("status %d: %s", w.Code, w.Body)
+				}
+				var response map[string]any
+				if stream {
+					completed := 0
+					next := 0
+					decoded := decodeChatSSE(strings.NewReader(w.Body.String()), func(event map[string]any) error {
+						if int(event["sequence_number"].(float64)) != next {
+							t.Fatal("nonsequential events")
+						}
+						next++
+						if event["type"] == "response.completed" {
+							completed++
+							response = event["response"].(map[string]any)
+						}
+						return nil
+					})
+					if decoded.Err != nil || completed != 1 || strings.Contains(w.Body.String(), "[DONE]") {
+						t.Fatalf("bad stream %s", w.Body)
+					}
+				} else if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if response["object"] != "response" || response["status"] != "completed" {
+					t.Fatalf("response %#v", response)
+				}
+				output := response["output"].([]any)
+				if len(output) != 2 || output[0].(map[string]any)["role"] != "user" || output[1].(map[string]any)["type"] != "compaction" {
+					t.Fatalf("canonical output %#v", output)
+				}
+				if response["usage"].(map[string]any)["total_tokens"] != float64(2) {
+					t.Fatal("usage lost")
+				}
+				input = append(output, map[string]any{"type": "compaction_trigger"})
+			}
+			if calls != 2 {
+				t.Fatalf("calls %d", calls)
+			}
+		})
+	}
+}
+
+func TestCompactionTriggerRejectsInvalidAndDisabledRequests(t *testing.T) {
+	codec, _ := testCompactionCodec(t)
+	for _, input := range []any{
+		[]any{map[string]any{"type": "compaction_trigger"}, map[string]any{"role": "user", "content": "later"}},
+		[]any{map[string]any{"type": "compaction_trigger"}, map[string]any{"type": "compaction_trigger"}},
+		[]any{map[string]any{"role": "user", "content": "hello"}, map[string]any{"type": "compaction_trigger", "extra": true}},
+		[]any{map[string]any{"type": "reasoning", "encrypted_content": "foreign"}, map[string]any{"type": "compaction_trigger"}},
+	} {
+		h := NewHandler(Config{ResponsesEnabled: true, APIKey: "key", Compaction: codec})
+		w := compactRequest(t, h, "/v1/responses", input)
+		if w.Code != 400 {
+			t.Fatalf("%d %s", w.Code, w.Body)
+		}
+	}
+	w := compactRequest(t, NewHandler(Config{ResponsesEnabled: true, APIKey: "key"}), "/v1/responses", []any{map[string]any{"role": "user", "content": "hello"}, map[string]any{"type": "compaction_trigger"}})
+	if w.Code != 404 {
+		t.Fatalf("disabled %d %s", w.Code, w.Body)
+	}
 }
