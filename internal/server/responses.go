@@ -19,17 +19,19 @@ import (
 )
 
 type responsesRequest struct {
-	Raw              map[string]any
-	Model            string
-	Stream           bool
-	Metadata         map[string]any
-	PromptCacheKey   string
-	Tools            []any
-	ToolChoice       any
-	ParallelTools    bool
-	ReasoningEffort  string
-	ReasoningSummary string
-	TextFormat       map[string]any
+	CompactionTrigger bool
+	Input             any // validated, expanded history; preserves public tool identities
+	Raw               map[string]any
+	Model             string
+	Stream            bool
+	Metadata          map[string]any
+	PromptCacheKey    string
+	Tools             []any
+	ToolChoice        any
+	ParallelTools     bool
+	ReasoningEffort   string
+	ReasoningSummary  string
+	TextFormat        map[string]any
 	// ClientMetadata is a Codex compatibility field. It is intentionally kept
 	// out of ChatBody because the WorkBuddy Chat upstream has no contract for it.
 	ClientMetadata any
@@ -78,6 +80,10 @@ func responsesToChat(raw []byte) ([]byte, map[string]any, error) {
 }
 
 func parseResponsesRequest(raw []byte) (responsesRequest, error) {
+	return parseResponsesRequestWithCompaction(raw, nil)
+}
+
+func parseResponsesRequestWithCompaction(raw []byte, codec *CompactionCodec) (responsesRequest, error) {
 	var req map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&req); err != nil || req == nil {
@@ -117,7 +123,15 @@ func parseResponsesRequest(raw []byte) (responsesRequest, error) {
 		return responsesRequest{}, responseBad("input", "input is required")
 	}
 
-	out := responsesRequest{Raw: req, Model: model, ParallelTools: true, ToolNames: newResponseToolNames()}
+	input, compact, err := stripCompactionTrigger(input)
+	if err != nil {
+		return responsesRequest{}, err
+	}
+	input, err = expandCompactionInput(input, codec)
+	if err != nil {
+		return responsesRequest{}, err
+	}
+	out := responsesRequest{CompactionTrigger: compact, Input: input, Raw: req, Model: model, ParallelTools: true, ToolNames: newResponseToolNames()}
 	if v, exists := req["client_metadata"]; exists {
 		// This is request metadata for Codex clients, not a WorkBuddy Chat
 		// control. Accept it explicitly but never copy it into ChatBody.
@@ -545,7 +559,7 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 	allowed := map[string]bool{}
 	switch typ {
 	case "message":
-		allowed = map[string]bool{"type": true, "role": true, "content": true, "phase": true, "id": true}
+		allowed = map[string]bool{"type": true, "role": true, "content": true, "phase": true, "id": true, "status": true, "internal_chat_message_metadata_passthrough": true}
 	case "input_text":
 		allowed = map[string]bool{"type": true, "text": true}
 	case "input_image":
@@ -580,6 +594,16 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 		if !ok || (role != "user" && role != "assistant" && role != "system" && role != "developer") {
 			return responseBad(fmt.Sprintf("input[%d].role", pos), "unsupported message role")
 		}
+		if metadata := item["internal_chat_message_metadata_passthrough"]; metadata != nil {
+			if _, ok := metadata.(map[string]any); !ok {
+				return responseBad(fmt.Sprintf("input[%d].internal_chat_message_metadata_passthrough", pos), "must be an object or null")
+			}
+		}
+		if status, exists := item["status"]; exists && status != nil {
+			if role != "assistant" || (status != "completed" && status != "in_progress" && status != "incomplete") {
+				return responseBad(fmt.Sprintf("input[%d].status", pos), "unsupported assistant message status")
+			}
+		}
 		if phase, exists := item["phase"]; exists && phase != nil {
 			phaseValue, ok := phase.(string)
 			if !ok {
@@ -592,6 +616,7 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 				return responseUnsupported(fmt.Sprintf("input[%d].phase", pos), "only commentary or final_answer is supported")
 			}
 		}
+		// Client-only Codex message metadata is accepted but never copied to Chat.
 		content, err := responsesContent(item["content"])
 		if err != nil {
 			return responseBad(fmt.Sprintf("input[%d].content", pos), err.Error())
@@ -730,6 +755,17 @@ func responsesContent(v any) (any, error) {
 		allowed := map[string]bool{"type": true}
 		if typ == "input_text" || typ == "output_text" {
 			allowed["text"] = true
+			if typ == "output_text" {
+				// Our Responses renderer emits this metadata. Accept the empty
+				// array on replay without forwarding it as Chat content.
+				allowed["annotations"] = true
+				if annotations, exists := part["annotations"]; exists {
+					items, ok := annotations.([]any)
+					if !ok || len(items) != 0 {
+						return nil, fmt.Errorf("content part %d only supports empty output_text annotations", i)
+					}
+				}
+			}
 		} else if typ == "input_image" {
 			allowed["image_url"] = true
 			allowed["detail"] = true
@@ -1656,14 +1692,17 @@ func decodeResponsesUpstream(req responsesRequest, rc io.Reader, started time.Ti
 }
 
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(r.Body)
+	raw, err := readCompactionBody(w, r)
 	if err != nil {
-		writeResponsesValidationError(w, responseBad("", "read body: "+err.Error()))
 		return
 	}
-	req, err := parseResponsesRequest(raw)
+	req, err := parseResponsesRequestWithCompaction(raw, h.cfg.Compaction)
 	if err != nil {
 		writeResponsesValidationError(w, err)
+		return
+	}
+	if req.CompactionTrigger {
+		h.compactionGate(func(w http.ResponseWriter, r *http.Request) { h.runCompaction(w, r, req, true) })(w, r)
 		return
 	}
 	encoder := &responseSSEEncoder{}

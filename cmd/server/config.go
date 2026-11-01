@@ -177,6 +177,9 @@ type Config struct {
 		// 404（code=endpoint_disabled）；开启后恢复无状态 Responses 子集。
 		// 热生效（经 livecfg 快照），面板保存即时生效，无需重启。
 		ResponsesEnabled bool `json:"responses_enabled"`
+		// CompactionKeyFile enables Chat-backed standalone compact with a private
+		// persistent 32-byte raw key. Empty disables it; changes require restart.
+		CompactionKeyFile string `json:"compaction_key_file,omitempty"`
 		// EmptyToolTurnRetryModels 对指定模型启用 stop + 无合法工具调用时的
 		// 有界换号重试。缺省 ["*"] 表示所有模型；模型 ID 可带 cn:/global: 前缀。
 		EmptyToolTurnRetryModels []string `json:"empty_tool_turn_retry_models"`

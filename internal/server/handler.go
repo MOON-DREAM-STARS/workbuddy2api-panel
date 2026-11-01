@@ -80,6 +80,9 @@ type Config struct {
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
 
+	// Compaction is an opt-in persistent codec; nil disables standalone compact.
+	Compaction *CompactionCodec
+
 	// ResponsesEnabled 原生 Responses 接口开关（config features.responses_enabled，
 	// 缺省 false = 仅 Chat API）。false 时 POST /v1/responses 在鉴权之前统一返回
 	// 404（code=endpoint_disabled），端点表现为"不存在"；true 时恢复无状态
@@ -156,6 +159,7 @@ func NewHandler(cfg Config) *Handler {
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.responsesGate(h.withAuth(h.responses)))
+	h.mux.HandleFunc("POST /v1/responses/compact", h.compactionGate(h.withAuth(h.compact)))
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
 	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
@@ -205,7 +209,7 @@ func (h *Handler) tracedRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	return r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses" || isSearchPath(r.URL.Path)
+	return r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/responses/compact" || isSearchPath(r.URL.Path)
 }
 
 // isSearchPath 判断是否为搜索端点。

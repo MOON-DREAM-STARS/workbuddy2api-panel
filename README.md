@@ -796,6 +796,7 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/responses/compact` | Bearer（`api_key` 非空时） | 默认关闭的 Chat 摘要压缩兼容接口；需持久化密钥，见 [compact 配置](COMPACTION.md) |
 | `POST /v1/responses` | Bearer（`api_key` 非空时） | 无状态 Responses 兼容子集（**默认关闭**，见下节「接口开关」）；复用同一账号池、粘性、冷却、用量与请求归档 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
@@ -812,6 +813,10 @@ http://127.0.0.1:7863/panel/
 `text` 可以省略或为空对象；`text.format` 缺省按普通文本处理，明确值只接受 `{ "type": "text" }`，`text.verbosity` 仅校验 `low`、`medium`、`high` 后不转发。历史中的 `message.id`、assistant `phase`、函数调用 ID、reasoning summary 与 `encrypted_content` 会校验并按兼容规则回放，敏感字段不会写入 Chat 上游。namespace 工具会映射为请求级稳定的内部函数名，Responses 输出恢复原始 namespace 与函数名；hosted/opaque 工具会被明确丢弃，不能被伪造成可执行函数。
 
 非流式响应返回 `object:"response"`，终态为 `completed`、`incomplete` 或 `failed`。流式响应使用 `response.*` SSE 事件和连续 `sequence_number`，不会泄露 Chat 的 `[DONE]`；缺少上游终止标记、非法帧、工具参数截断或 error frame 时不会报告为 completed。`reasoning.summary` 生效时会输出 reasoning summary 的 added/delta/done 生命周期事件。
+
+### Standalone compact（默认关闭）
+
+支持 `POST /v1/responses/compact` → `response.compaction.output` 原样回放到 `/v1/responses` → 再次 compact。它是在 Chat 上游上生成摘要并以独立密钥加密的网关兼容实现，不等同于 OpenAI 的内部压缩算法；不能读取其它服务生成的 opaque compaction。启用、密钥备份、New API 路由及边界详见 [COMPACTION.md](COMPACTION.md)。
 
 ### `stop` 空工具回合保护（Issue #149）
 
