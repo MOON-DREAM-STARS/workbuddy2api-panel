@@ -138,9 +138,12 @@ func expandCompactionInput(input any, codec *CompactionCodec) (any, error) {
 		}
 		param := fmt.Sprintf("input[%d]", i)
 		for key := range item {
-			if key != "type" && key != "id" && key != "encrypted_content" {
+			if key != "type" && key != "id" && key != "encrypted_content" && key != "internal_chat_message_metadata_passthrough" {
 				return nil, responseUnsupported(param+"."+key, "field is not supported")
 			}
+		}
+		if err := validateResponseItemMetadata(item, param); err != nil {
+			return nil, err
 		}
 		if id, exists := item["id"]; exists && id != nil {
 			if _, ok := id.(string); !ok {

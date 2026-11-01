@@ -551,6 +551,17 @@ type responseHistory struct {
 	outputs  map[string]bool
 }
 
+// Codex annotates all history item kinds, including reasoning and compaction.
+// This metadata has no Chat meaning; callers only validate it, never forward it.
+func validateResponseItemMetadata(item map[string]any, param string) error {
+	if metadata := item["internal_chat_message_metadata_passthrough"]; metadata != nil {
+		if _, ok := metadata.(map[string]any); !ok {
+			return responseBad(param+".internal_chat_message_metadata_passthrough", "must be an object or null")
+		}
+	}
+	return nil
+}
+
 func (h *responseHistory) add(item map[string]any, pos int) error {
 	typ, _ := item["type"].(string)
 	if typ == "" {
@@ -573,6 +584,10 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 	default:
 		return responseUnsupported(fmt.Sprintf("input[%d].type", pos), "supported types are message, input_text, input_image, reasoning, function_call, and function_call_output")
 	}
+	allowed["internal_chat_message_metadata_passthrough"] = true
+	if err := validateResponseItemMetadata(item, fmt.Sprintf("input[%d]", pos)); err != nil {
+		return err
+	}
 	for key := range item {
 		if !allowed[key] {
 			return responseUnsupported(fmt.Sprintf("input[%d].%s", pos, key), "field is not supported")
@@ -593,11 +608,6 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 		role, ok := item["role"].(string)
 		if !ok || (role != "user" && role != "assistant" && role != "system" && role != "developer") {
 			return responseBad(fmt.Sprintf("input[%d].role", pos), "unsupported message role")
-		}
-		if metadata := item["internal_chat_message_metadata_passthrough"]; metadata != nil {
-			if _, ok := metadata.(map[string]any); !ok {
-				return responseBad(fmt.Sprintf("input[%d].internal_chat_message_metadata_passthrough", pos), "must be an object or null")
-			}
 		}
 		if status, exists := item["status"]; exists && status != nil {
 			if role != "assistant" || (status != "completed" && status != "in_progress" && status != "incomplete") {
