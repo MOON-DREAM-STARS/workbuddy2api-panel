@@ -117,6 +117,10 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 		trace.stat = st
 	}
 	defer st.done()
+	if _, hidden := h.loadLive().HiddenModels[realm+":"+bareModel]; hidden {
+		st.status, st.outcome = http.StatusBadRequest, reqlog.OutcomeHTTPError
+		return ChatOutcome{Status: http.StatusBadRequest}, &chatFailure{Status: http.StatusBadRequest, Code: "model_unavailable", Message: "model is hidden by gateway configuration, try another model"}
+	}
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -765,12 +769,4 @@ func recordResponsesUsage(h *Handler, st *chatStat, uid, model string, delta poo
 		ModelRate: modelRate,
 		LatencyMs: delta.LatencyMs, HasLatency: delta.HasLatencyMs,
 	}, delta.HasPromptTokens || delta.HasCompletionTokens || delta.HasTotalTokens)
-}
-
-func requestTraceFromContext(ctx context.Context) *requestTrace {
-	if ctx == nil {
-		return nil
-	}
-	trace, _ := ctx.Value(requestTraceKey{}).(*requestTrace)
-	return trace
 }
