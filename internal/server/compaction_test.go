@@ -368,7 +368,11 @@ func TestCompactionTriggerResponsesRoundTrip(t *testing.T) {
 				if response["usage"].(map[string]any)["total_tokens"] != float64(2) {
 					t.Fatal("usage lost")
 				}
-				input = append(output, map[string]any{"type": "compaction_trigger"})
+				// Codex annotates both returned compaction and reasoning history.
+				output[len(output)-1].(map[string]any)["internal_chat_message_metadata_passthrough"] = map[string]any{"content_item_kinds": []any{"unknown"}}
+				input = append(output,
+					map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "previous answer plan"}}, "internal_chat_message_metadata_passthrough": map[string]any{"turn_id": "synthetic"}},
+					map[string]any{"type": "compaction_trigger"})
 			}
 			if calls != 2 {
 				t.Fatalf("calls %d", calls)
