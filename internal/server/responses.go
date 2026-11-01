@@ -19,6 +19,7 @@ import (
 )
 
 type responsesRequest struct {
+	Input            any // validated, expanded history; preserves public tool identities
 	Raw              map[string]any
 	Model            string
 	Stream           bool
@@ -78,6 +79,10 @@ func responsesToChat(raw []byte) ([]byte, map[string]any, error) {
 }
 
 func parseResponsesRequest(raw []byte) (responsesRequest, error) {
+	return parseResponsesRequestWithCompaction(raw, nil)
+}
+
+func parseResponsesRequestWithCompaction(raw []byte, codec *CompactionCodec) (responsesRequest, error) {
 	var req map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&req); err != nil || req == nil {
@@ -117,7 +122,11 @@ func parseResponsesRequest(raw []byte) (responsesRequest, error) {
 		return responsesRequest{}, responseBad("input", "input is required")
 	}
 
-	out := responsesRequest{Raw: req, Model: model, ParallelTools: true, ToolNames: newResponseToolNames()}
+	input, err := expandCompactionInput(input, codec)
+	if err != nil {
+		return responsesRequest{}, err
+	}
+	out := responsesRequest{Input: input, Raw: req, Model: model, ParallelTools: true, ToolNames: newResponseToolNames()}
 	if v, exists := req["client_metadata"]; exists {
 		// This is request metadata for Codex clients, not a WorkBuddy Chat
 		// control. Accept it explicitly but never copy it into ChatBody.
@@ -545,7 +554,7 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 	allowed := map[string]bool{}
 	switch typ {
 	case "message":
-		allowed = map[string]bool{"type": true, "role": true, "content": true, "phase": true, "id": true}
+		allowed = map[string]bool{"type": true, "role": true, "content": true, "phase": true, "id": true, "status": true}
 	case "input_text":
 		allowed = map[string]bool{"type": true, "text": true}
 	case "input_image":
@@ -579,6 +588,11 @@ func (h *responseHistory) add(item map[string]any, pos int) error {
 		role, ok := item["role"].(string)
 		if !ok || (role != "user" && role != "assistant" && role != "system" && role != "developer") {
 			return responseBad(fmt.Sprintf("input[%d].role", pos), "unsupported message role")
+		}
+		if status, exists := item["status"]; exists && status != nil {
+			if role != "assistant" || (status != "completed" && status != "in_progress" && status != "incomplete") {
+				return responseBad(fmt.Sprintf("input[%d].status", pos), "unsupported assistant message status")
+			}
 		}
 		if phase, exists := item["phase"]; exists && phase != nil {
 			phaseValue, ok := phase.(string)
@@ -730,6 +744,17 @@ func responsesContent(v any) (any, error) {
 		allowed := map[string]bool{"type": true}
 		if typ == "input_text" || typ == "output_text" {
 			allowed["text"] = true
+			if typ == "output_text" {
+				// Our Responses renderer emits this metadata. Accept the empty
+				// array on replay without forwarding it as Chat content.
+				allowed["annotations"] = true
+				if annotations, exists := part["annotations"]; exists {
+					items, ok := annotations.([]any)
+					if !ok || len(items) != 0 {
+						return nil, fmt.Errorf("content part %d only supports empty output_text annotations", i)
+					}
+				}
+			}
 		} else if typ == "input_image" {
 			allowed["image_url"] = true
 			allowed["detail"] = true
@@ -1656,12 +1681,11 @@ func decodeResponsesUpstream(req responsesRequest, rc io.Reader, started time.Ti
 }
 
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(r.Body)
+	raw, err := readCompactionBody(w, r)
 	if err != nil {
-		writeResponsesValidationError(w, responseBad("", "read body: "+err.Error()))
 		return
 	}
-	req, err := parseResponsesRequest(raw)
+	req, err := parseResponsesRequestWithCompaction(raw, h.cfg.Compaction)
 	if err != nil {
 		writeResponsesValidationError(w, err)
 		return

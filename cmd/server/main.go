@@ -73,6 +73,14 @@ func main() {
 		}
 	}
 
+	var compaction *server.CompactionCodec
+	if cfg.Features.CompactionKeyFile != "" {
+		compaction, err = server.LoadCompactionCodec(cfg.Features.CompactionKeyFile)
+		if err != nil {
+			log.Fatalf("load compaction key: %v", err)
+		}
+	}
+
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
@@ -356,6 +364,7 @@ func main() {
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// 原生 Responses 接口开关经 livecfg 热生效；静态字段同为 Live=nil 兜底。
+		Compaction:               compaction,
 		ResponsesEnabled:         cfg.Features.ResponsesEnabled,
 		EmptyToolTurnRetryModels: cfg.Features.EmptyToolTurnRetryModels,
 		EmptyToolTurnMaxRetries:  cfg.Features.EmptyToolTurnMaxRetries,
@@ -585,6 +594,7 @@ func applyCNChatBase(up *upstream.Client, cfg *Config) {
 // 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
 func restartRequiredFields(c *Config) []string {
 	var out []string
+	out = append(out, "features.compaction_key_file")
 	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
 	if c.Listen != "" {
 		out = append(out, "listen")
