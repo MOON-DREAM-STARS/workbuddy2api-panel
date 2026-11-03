@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -1613,8 +1614,8 @@ func (r *responsesRenderer) FailStream(code, message, _ string) error {
 	return r.encoder.err
 }
 
-func (r *responsesRenderer) RenderStream(_ context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {
-	state, stats, decoded := decodeResponsesUpstream(r.req, rc, meta.Started, r.encoder, r.state)
+func (r *responsesRenderer) RenderStream(ctx context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {
+	state, stats, decoded := decodeResponsesUpstream(ctx, r.req, rc, meta.Started, r.encoder, r.state)
 	r.state = state
 	state.priorUsage = meta.PriorUsage
 	state.finish(decoded.SawDone, decoded.Err)
@@ -1623,16 +1624,24 @@ func (r *responsesRenderer) RenderStream(_ context.Context, rc io.ReadCloser, me
 	if decoded.Err != nil {
 		out.ReadErr = decoded.Err
 	}
+	if r.encoder != nil && r.encoder.err != nil {
+		out.RendererErr, out.ReadErr = r.encoder.err, nil
+	} else if ctx != nil && ctx.Err() != nil {
+		out.RendererErr, out.ReadErr = ctx.Err(), nil
+	}
 	return out
 }
 
-func (r *responsesRenderer) RenderNonStream(_ context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {
-	state, _, decoded := decodeResponsesUpstream(r.req, rc, time.Time{}, nil, nil)
+func (r *responsesRenderer) RenderNonStream(ctx context.Context, rc io.ReadCloser, meta ChatRenderMeta) ChatOutcome {
+	state, _, decoded := decodeResponsesUpstream(ctx, r.req, rc, time.Time{}, nil, nil)
 	state.priorUsage = meta.PriorUsage
 	state.finish(decoded.SawDone, decoded.Err)
 	out := state.outcome()
 	if decoded.Err != nil {
 		out.ReadErr = decoded.Err
+	}
+	if ctx != nil && ctx.Err() != nil {
+		out.RendererErr, out.ReadErr = ctx.Err(), nil
 	}
 	return out
 }
@@ -1675,7 +1684,13 @@ func (w *responsePipeWriter) Write(p []byte) (int, error) {
 }
 func (w *responsePipeWriter) Flush() {}
 
-func decodeResponsesUpstream(req responsesRequest, rc io.Reader, started time.Time, encoder *responseSSEEncoder, state *responseState) (*responseState, *chatStatsReader, chatSSEDecodeResult) {
+func decodeResponsesUpstream(ctx context.Context, req responsesRequest, rc io.ReadCloser, started time.Time, encoder *responseSSEEncoder, state *responseState) (*responseState, *chatStatsReader, chatSSEDecodeResult) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var closeOnce sync.Once
+	closeUpstream := func() { closeOnce.Do(func() { _ = rc.Close() }) }
+	defer closeUpstream()
 	tracked := &responseDoneReader{r: rc}
 	statsStart := started
 	if statsStart.IsZero() {
@@ -1686,14 +1701,45 @@ func decodeResponsesUpstream(req responsesRequest, rc io.Reader, started time.Ti
 		state = newResponseState(req, encoder != nil, encoder)
 	}
 	state.start()
+	if err := ctx.Err(); err != nil {
+		return state, stats, chatSSEDecodeResult{Err: err}
+	}
+	if encoder != nil && encoder.err != nil {
+		return state, stats, chatSSEDecodeResult{Err: encoder.err}
+	}
 	reader, writer := io.Pipe()
+	workerDone := make(chan struct{})
 	go func() {
+		defer close(workerDone)
 		repair := upstream.NewMarkupRepair(upstream.ToolNameAllowlist(req.ChatBody), true)
 		err := upstream.StreamHint(&responsePipeWriter{pipe: writer, header: make(http.Header)}, stats, nil, upstream.WithMarkupRepair(repair))
 		_ = writer.CloseWithError(err)
 	}()
-	decoded := decodeChatSSE(reader, state.consumeChunk)
+	// Closing only the pipe cannot interrupt a normalizer blocked in an
+	// upstream Read. Close both ends on cancellation, and join the worker before
+	// inspecting its DONE/usage observations or releasing the account lease.
+	stopCancel := context.AfterFunc(ctx, func() {
+		closeUpstream()
+		_ = reader.CloseWithError(ctx.Err())
+	})
+	defer stopCancel()
+	decoded := decodeChatSSE(reader, func(chunk map[string]any) error {
+		if err := state.consumeChunk(chunk); err != nil {
+			return err
+		}
+		// emit records a failed downstream write; propagate it immediately rather
+		// than consuming an active (possibly repeating) generation to its end.
+		if encoder != nil {
+			return encoder.err
+		}
+		return nil
+	})
 	_ = reader.CloseWithError(decoded.Err)
+	closeUpstream()
+	<-workerDone
+	if ctx.Err() != nil {
+		decoded.Err = ctx.Err()
+	}
 	decoded.SawDone = tracked.sawDone
 	if !tracked.sawDone && decoded.Err == nil {
 		decoded.Err = errors.New("upstream stream ended before [DONE]")
