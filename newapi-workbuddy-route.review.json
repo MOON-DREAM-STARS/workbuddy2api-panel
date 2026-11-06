@@ -1,0 +1,39 @@
+{
+  "plan_format": "dreamstars.review-only.v1",
+  "status": "pending_collaborator_review",
+  "apply_changes": false,
+  "notice": "Review plan only; not a New API import file or management API payload.",
+  "target_channel": {
+    "id": 6,
+    "expected_type": 58,
+    "preserve_groups": "default,vip"
+  },
+  "channel_delta": {
+    "append_models": ["workbuddy-deepseek-v4.1-flash"],
+    "preserve_existing_models": true,
+    "merge_model_mapping": {
+      "workbuddy-deepseek-v4.1-flash": "deepseek-v4.1-flash"
+    },
+    "preserve_existing_model_mapping": {
+      "deepseek-v4.1-flash": "cn:deepseek-v4.1-flash"
+    },
+    "required_routes": [
+      {"incoming_path": "/v1/responses", "upstream_path": "/v1/responses", "converter": "none"},
+      {"incoming_path": "/v1/responses/compact", "upstream_path": "/v1/responses/compact", "converter": "none"}
+    ]
+  },
+  "pricing_review": {
+    "copy_effective_configuration_from": "deepseek-v4.1-flash",
+    "target_model": "workbuddy-deepseek-v4.1-flash",
+    "validate_before_enabling_alias": true
+  },
+  "client_model_after_review": "workbuddy-deepseek-v4.1-flash",
+  "acceptance": {
+    "expected_channel_id_for_every_request": 6,
+    "alias_exclusive_to_same_workbuddy_key_pool": true,
+    "verify_model_permissions_and_pricing": true,
+    "verify_request_ids_against_channel_logs": true,
+    "verify_compact_replay_and_fact_retention": true
+  },
+  "production_applied": false
+}
