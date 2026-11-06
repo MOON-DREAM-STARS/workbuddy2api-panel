@@ -1712,7 +1712,8 @@ func decodeResponsesUpstream(ctx context.Context, req responsesRequest, rc io.Re
 	go func() {
 		defer close(workerDone)
 		repair := upstream.NewMarkupRepair(upstream.ToolNameAllowlist(req.ChatBody), true)
-		err := upstream.StreamHint(&responsePipeWriter{pipe: writer, header: make(http.Header)}, stats, nil, upstream.WithMarkupRepair(repair))
+		err := upstream.StreamHint(&responsePipeWriter{pipe: writer, header: make(http.Header)}, stats, nil,
+			upstream.WithMarkupRepair(repair), upstream.WithStrictSingleChoiceFinish())
 		_ = writer.CloseWithError(err)
 	}()
 	// Closing only the pipe cannot interrupt a normalizer blocked in an
