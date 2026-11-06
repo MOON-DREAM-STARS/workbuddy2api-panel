@@ -485,6 +485,14 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	strictFinish bool
+}
+
+// WithStrictSingleChoiceFinish rejects output sent after the single upstream
+// choice has finished. Usage-only frames can still precede [DONE]. Apply this
+// before markup repair, which may flush text buffered before the finish frame.
+func WithStrictSingleChoiceFinish() StreamOption {
+	return func(o *streamOptions) { o.strictFinish = true }
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -674,6 +682,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		return out
 	}
 
+	choiceFinished := false
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
 	writeFrame := func(payload string) (int, error) {
@@ -698,6 +707,18 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				return 0, werr
 			}
 			return 1, nil
+		}
+		if o.strictFinish {
+			choices, _ := obj["choices"].([]any)
+			for _, raw := range choices {
+				choice, _ := raw.(map[string]any)
+				if choiceFinished && hasChatOutputDelta(choice) {
+					return 0, errors.New("upstream sent output after finish_reason")
+				}
+				if finish, _ := choice["finish_reason"].(string); finish != "" {
+					choiceFinished = true
+				}
+			}
 		}
 		for _, ch := range repairFrame(obj) {
 			if werr := writeChunk(ch, payload); werr != nil {
@@ -782,6 +803,22 @@ readLoop:
 		return errEmptyStream
 	}
 	return nil
+}
+
+func hasChatOutputDelta(choice map[string]any) bool {
+	delta, _ := choice["delta"].(map[string]any)
+	for _, key := range []string{"content", "reasoning_content", "refusal"} {
+		if text, _ := delta[key].(string); text != "" {
+			return true
+		}
+	}
+	if calls, _ := delta["tool_calls"].([]any); len(calls) > 0 {
+		return true
+	}
+	fn, _ := delta["function_call"].(map[string]any)
+	name, _ := fn["name"].(string)
+	arguments, _ := fn["arguments"].(string)
+	return name != "" || arguments != ""
 }
 
 // frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。
