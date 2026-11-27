@@ -107,6 +107,7 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 
 	realm, bareModel := resolveModel(req.Model)
 	emptyToolRetryEnabled := h.emptyToolTurnRetryEnabled(req.Model, req.Body)
+	_, responsesStream := renderer.(*responsesRenderer)
 	var streamLifecycle chatStreamLifecycle
 	if lifecycle, ok := renderer.(chatStreamLifecycle); ok {
 		streamLifecycle = lifecycle
@@ -290,7 +291,25 @@ func (h *Handler) executeChat(req ChatExecutionRequest, renderer ChatRenderer) (
 				break
 			}
 			bufferedStats = newChatStatsReaderSince(rc, attemptStarted)
-			raw, readErr := readValidatedResponse(bufferedStats)
+			var source io.Reader = bufferedStats
+			var readErr error
+			if req.Stream && responsesStream && !emptyRetryState.hasRetried() {
+				var hasText bool
+				source, hasText, readErr = readResponsesValidationPrefix(source)
+				if hasText {
+					// The first attempt has no local retry deadline. The renderer
+					// owns the upstream body and cancellation from this point.
+					rc = struct {
+						io.Reader
+						io.Closer
+					}{source, rc}
+					break
+				}
+			}
+			var raw []byte
+			if readErr == nil {
+				raw, readErr = readValidatedResponse(source)
+			}
 			_ = rc.Close()
 			attemptCancel()
 			if readErr != nil && emptyRetryState.deadlineHit(localDeadline, attemptCtx) {
