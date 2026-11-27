@@ -36,55 +36,65 @@ func (w stopTestWriter) Write(p []byte) (int, error) {
 
 // A repeating upstream never reaches EOF or an idle timeout on its own.
 func TestResponsesStopsOnDownstreamWriteFailure(t *testing.T) {
-	reader, writer := io.Pipe()
-	body := &stopTestBody{PipeReader: reader, closed: make(chan struct{})}
-	defer body.Close()
-	defer writer.Close()
-	errClient := errors.New("client stopped reading")
-	renderer := &responsesRenderer{req: responsesRequest{Model: "m"}, encoder: &responseSSEEncoder{w: stopTestWriter{err: errClient}}}
-	p := testPoolWith(&auth.Auth{UID: "stop-test", AccessToken: "synthetic", ExpiresAt: time.Now().Add(time.Hour).Unix()})
-	p.SetMaxInFlight(1)
-	calls := 0
-	up := &upstream.Client{ChatBaseCN: "https://fake.example", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		calls++
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body}, nil
-	})}}
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3})
-	done := make(chan ChatOutcome, 1)
-	go func() {
-		out, _ := h.executeChat(ChatExecutionRequest{Context: context.Background(), Model: "m", Stream: true, Body: []byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":"synthetic"}]}`)}, renderer)
-		done <- out
-	}()
-	producerDone := make(chan struct{})
-	go func() {
-		defer close(producerDone)
-		for {
-			if _, err := io.WriteString(writer, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"重复一句话。\"}}]}\n\n"); err != nil {
-				return
+	for _, tc := range []struct {
+		name  string
+		tools string
+	}{
+		{name: "without tools"},
+		{name: "with auto tools", tools: `,"tools":[{"type":"function","function":{"name":"read"}}],"tool_choice":"auto"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader, writer := io.Pipe()
+			body := &stopTestBody{PipeReader: reader, closed: make(chan struct{})}
+			defer body.Close()
+			defer writer.Close()
+			errClient := errors.New("client stopped reading")
+			renderer := &responsesRenderer{req: responsesRequest{Model: "m"}, encoder: &responseSSEEncoder{w: stopTestWriter{err: errClient}}}
+			p := testPoolWith(&auth.Auth{UID: "stop-test", AccessToken: "synthetic", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+			p.SetMaxInFlight(1)
+			calls := 0
+			up := &upstream.Client{ChatBaseCN: "https://fake.example", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body}, nil
+			})}}
+			h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3, EmptyToolTurnRetryModels: []string{"*"}})
+			done := make(chan ChatOutcome, 1)
+			go func() {
+				out, _ := h.executeChat(ChatExecutionRequest{Context: context.Background(), Model: "m", Stream: true, Body: []byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":"synthetic"}]` + tc.tools + `}`)}, renderer)
+				done <- out
+			}()
+			producerDone := make(chan struct{})
+			go func() {
+				defer close(producerDone)
+				for {
+					if _, err := io.WriteString(writer, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"重复一句话。\"}}]}\n\n"); err != nil {
+						return
+					}
+				}
+			}()
+			select {
+			case out := <-done:
+				if !errors.Is(out.RendererErr, errClient) || out.ReadErr != nil {
+					t.Fatalf("write failure must be an interruption: %+v", out)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("renderer kept reading upstream after downstream write failed")
 			}
-		}
-	}()
-	select {
-	case out := <-done:
-		if !errors.Is(out.RendererErr, errClient) || out.ReadErr != nil {
-			t.Fatalf("write failure must be an interruption: %+v", out)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("renderer kept reading upstream after downstream write failed")
-	}
-	select {
-	case <-body.closed:
-	default:
-		t.Fatal("upstream body was not closed")
-	}
-	select {
-	case <-producerDone:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("repeating upstream producer did not stop")
-	}
-	status, _ := p.Status("stop-test")
-	if calls != 1 || status.InFlight != 0 || status.ErrTotal != 0 || status.SuccessCount != 0 {
-		t.Fatalf("interruption retried, leaked a lease, or changed account health: calls=%d status=%+v", calls, status)
+			select {
+			case <-body.closed:
+			default:
+				t.Fatal("upstream body was not closed")
+			}
+			select {
+			case <-producerDone:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("repeating upstream producer did not stop")
+			}
+			status, _ := p.Status("stop-test")
+			if calls != 1 || status.InFlight != 0 || status.ErrTotal != 0 || status.SuccessCount != 0 {
+				t.Fatalf("interruption retried, leaked a lease, or changed account health: calls=%d status=%+v", calls, status)
+			}
+		})
 	}
 }
 

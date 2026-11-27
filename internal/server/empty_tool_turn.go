@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -196,6 +197,60 @@ func readValidatedResponse(r io.Reader) ([]byte, error) {
 		return nil, errValidatedResponseTooLarge
 	}
 	return data, nil
+}
+
+// readResponsesValidationPrefix preserves the original bytes. Once the first
+// choice starts with visible text outside a possible DSML tag, later frames
+// cannot turn it into an empty tool turn. Keep ambiguous prefixes on the
+// full validation path.
+func readResponsesValidationPrefix(r io.Reader) (io.Reader, bool, error) {
+	const probeLimit = 64 << 10
+	var prefix bytes.Buffer
+	input := bufio.NewReaderSize(r, 8<<10)
+	source := io.MultiReader(&prefix, input)
+	for prefix.Len() < probeLimit {
+		line, err := input.ReadSlice('\n')
+		prefix.Write(line)
+		switch err {
+		case nil:
+		case io.EOF:
+			return &prefix, false, nil
+		case bufio.ErrBufferFull:
+			return source, false, nil
+		default:
+			return nil, false, err
+		}
+		payload, ok := bytes.CutPrefix(line, []byte("data: "))
+		if !ok {
+			continue
+		}
+		var frame struct {
+			Error   json.RawMessage `json:"error"`
+			Choices []struct {
+				Index        int             `json:"index"`
+				FinishReason string          `json:"finish_reason"`
+				Message      json.RawMessage `json:"message"`
+				Delta        struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal(payload, &frame) != nil || (len(frame.Error) > 0 && !bytes.Equal(frame.Error, []byte("null"))) {
+			return source, false, nil
+		}
+		if len(frame.Choices) == 0 {
+			continue
+		}
+		choice := frame.Choices[0]
+		if len(frame.Choices) != 1 || choice.Index != 0 || choice.FinishReason != "" ||
+			(len(choice.Message) > 0 && !bytes.Equal(choice.Message, []byte("null"))) {
+			return source, false, nil
+		}
+		if content := strings.TrimSpace(choice.Delta.Content); content != "" {
+			return source, !strings.HasPrefix(content, "<"), nil
+		}
+	}
+	return source, false, nil
 }
 
 // mergeUsageMaps combines counters from earlier rejected attempts (prior) and
