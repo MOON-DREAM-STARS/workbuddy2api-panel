@@ -78,6 +78,20 @@ compact 请求支持 `model`、`input`、`instructions`，以及现有 Responses
 
 这是 `advanced_custom.advanced_routes` 的条目示意，Base URL 应指向已启用功能的 WorkBuddy；不要直接覆盖整个渠道配置。不能继续使用 `openai_responses_to_openai_chat_completions`：转换成 Chat 后，压缩项无法回到 WorkBuddy 的 Responses 解码路径。模型映射和负载均衡必须让后续请求回到具有相同密钥的网关，不能切换到 OpenAI 或其它供应商。上线前分别验证直连及 New API 的 compact → Responses → compact 流程。
 
+### 同名多渠道：待审的独占模型别名方案
+
+两条路径都配置透传，仍不保证同名模型的后续请求进入同一渠道。Issue #2 的生产合成验证中，WorkBuddy 渠道 6 生成了 capsule，后续请求却进入 DeepSeek 渠道 7；因此当时的编号校验失败不能归因于 WorkBuddy 摘要丢失。固定渠道 6 后，真实 Codex 的 compact/回放通过，VPS 内存检查确认摘要含编号、回放 capsule 一致、回答含编号三项均为 true。该结果仅覆盖本次合成场景。
+
+建议为 WorkBuddy 提供独占别名，例如 `workbuddy-deepseek-v4.1-flash`。本 fork 的具体差异见 [只读方案示例](newapi-workbuddy-route.review.json)：**该文件不是 New API 导入格式或管理 API 请求体，不会自动应用；须由合作者审核后再实施。**
+
+1. 仅在 WorkBuddy 渠道 6 追加别名，保留原模型列表和其它渠道。合并新增映射 `workbuddy-deepseek-v4.1-flash` → `deepseek-v4.1-flash`，并保留既有的 `deepseek-v4.1-flash` → `cn:deepseek-v4.1-flash`；映射链最终仍进入原 CN 模型。不要整体覆盖现有映射。
+2. 启用别名前，为它复制原模型的**有效计费配置**：计费模式、价格/倍率、输出及缓存倍率等适用项。New API 按原始请求模型名解析计费，不能假定渠道模型映射会自动继承价格；不要用忽略未配置价格的方式绕过检查，也不在示例中虚构价格数值。
+3. 核对用户/令牌模型权限、分组和模型目录；若启用了上游模型自动同步，确认它不会移除人工别名。两条 Responses 路由仍用 `converter=none`。所有提供该别名的副本必须属于同一 WorkBuddy 密钥池，不能把它加入其它供应商渠道作为回退。
+4. 客户端从会话开始就选择该别名，并在 compact 与后续 Responses 中保持一致。旧的裸模型名继续保留，但共享裸名的多渠道路由不能保证 capsule 可移植。严格会话亲和可额外评估，不能替代首次请求的正确路由和独占命名。
+5. 审核后实施时，先导出渠道及定价配置并限制备份权限，再逐项修改；待渠道缓存刷新后验证实际客户端。用每条请求的 `X-Oneapi-Request-Id` 对照 New API 日志的 `channel_id`，确认 compact 和回放都进入渠道 6，并核对 usage/计费与编号保留。失败则还原本次新增别名、映射及定价配置，并让测试客户端恢复原模型；已持有 capsule 的会话应保留原历史，不能切到其它供应商继续回放。
+
+诊断中站长凭据的单渠道选择仅用于受控验证；普通用户无此权限，不应为此分发站长令牌。生产方案采用模型别名。本次别名方案尚未应用、尚未做别名的生产调用验证；合并文档也不等于配置已生效。合并和配置实施均等待合作者审核。
+
 ## 限制与失败处理
 
 - 保留所有 user、system、developer 消息，压缩 assistant、可读 reasoning summary 及已完成的工具交互。shorthand input_text/input_image 规范化为 user 消息。用户消息中的图片保持原输入；摘要调用只看到序列化的历史，不重新执行工具或识图。
